@@ -1,0 +1,557 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+public class GameMain : MonoBehaviour
+{
+    enum State { Select, Menu, Shop, Fight, Result }
+
+    const long StartCoins = 999999999L;
+
+    static readonly Color[] Hairs =
+    {
+        new Color(0.15f, 0.1f, 0.08f), new Color(0.85f, 0.7f, 0.3f),
+        new Color(0.7f, 0.15f, 0.1f), new Color(0.86f, 0.86f, 0.9f),
+    };
+
+    State state = State.Select;
+    Camera cam;
+    Fighter player, enemy, prevM, prevF;
+    Texture2D white;
+    long coins, lastReward;
+    HashSet<string> owned = new HashSet<string>();
+    string eqW, eqH, eqA;
+    bool female, won;
+    int oppFaction = -1;                 // -1 = random
+    const int MaxLevel = 30;
+    static readonly string[] OppNames = { "Случайный", "Легион", "Династия", "Вестники", "Гильдия Теней" };
+    int hairIdx, level = 1;
+    float countdown, roundTime, koTimer;
+    enum RState { Intro, Fight, KO }
+    RState rs;
+    int round = 1, pWins, eWins;
+    string koText = "K.O.";
+    bool lastRoundPlayer;
+    Slot tab = Slot.Weapon;
+    int factionFilter = -1;
+    Vector2 scroll;
+    Faction enemyFaction;
+
+    bool demo, demoFemale, demoNatural, menuShot, menuShotDone, demoFastKo;
+    float demoLog;
+    float demoT;
+    int demoShots;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+    static void Boot()
+    {
+        if (FindFirstObjectByType<GameMain>() == null) new GameObject("Game").AddComponent<GameMain>();
+    }
+
+    // ---------- save ----------
+    void Load()
+    {
+        coins = long.Parse(PlayerPrefs.GetString("coins", StartCoins.ToString()));
+        level = Mathf.Clamp(PlayerPrefs.GetInt("level", 1), 1, MaxLevel);
+        oppFaction = Mathf.Clamp(PlayerPrefs.GetInt("oppF", -1), -1, 3);
+        foreach (string s in PlayerPrefs.GetString("owned", "W_0_0_1,H_0_0,A_0_0").Split(','))
+            if (s.Length > 0) owned.Add(s);
+        female = PlayerPrefs.GetInt("female", 0) == 1;
+        hairIdx = PlayerPrefs.GetInt("hair", 0);
+        eqW = PlayerPrefs.GetString("eqW", "W_0_0_1");
+        eqH = PlayerPrefs.GetString("eqH", "H_0_0");
+        eqA = PlayerPrefs.GetString("eqA", "A_0_0");
+        // saves from older versions may reference gear that no longer exists
+        if (Db.Get(eqW) == null || Db.Get(eqW).slot != Slot.Weapon) eqW = "W_0_0_1";
+        if (Db.Get(eqH) == null || Db.Get(eqH).slot != Slot.Helmet) eqH = "H_0_0";
+        if (Db.Get(eqA) == null || Db.Get(eqA).slot != Slot.Armor) eqA = "A_0_0";
+        owned.RemoveWhere(id => Db.Get(id) == null);
+        owned.Add("W_0_0_1"); owned.Add("H_0_0"); owned.Add("A_0_0");
+        owned.Add(eqW); owned.Add(eqH); owned.Add(eqA);
+        state = PlayerPrefs.GetInt("chosen", 0) == 1 ? State.Menu : State.Select;
+    }
+
+    void Save()
+    {
+        PlayerPrefs.SetString("coins", coins.ToString());
+        PlayerPrefs.SetInt("level", level);
+        PlayerPrefs.SetInt("oppF", oppFaction);
+        PlayerPrefs.SetString("owned", string.Join(",", new List<string>(owned).ToArray()));
+        PlayerPrefs.SetInt("female", female ? 1 : 0);
+        PlayerPrefs.SetInt("hair", hairIdx);
+        PlayerPrefs.SetString("eqW", eqW);
+        PlayerPrefs.SetString("eqH", eqH);
+        PlayerPrefs.SetString("eqA", eqA);
+        PlayerPrefs.SetInt("chosen", 1);
+        PlayerPrefs.Save();
+    }
+
+    // ---------- setup ----------
+    void Awake()
+    {
+        Load();
+        white = new Texture2D(1, 1);
+        white.SetPixel(0, 0, Color.white);
+        white.Apply();
+
+        cam = Camera.main;
+        if (cam == null)
+        {
+            var go = new GameObject("Main Camera");
+            go.tag = "MainCamera";
+            cam = go.AddComponent<Camera>();
+            go.AddComponent<AudioListener>();
+        }
+        cam.orthographic = false;
+        cam.fieldOfView = 50f;
+        cam.clearFlags = CameraClearFlags.SolidColor;
+        cam.backgroundColor = new Color(0.05f, 0.05f, 0.1f);
+        foreach (var l in FindObjectsByType<Light>(FindObjectsSortMode.None)) Destroy(l.gameObject);
+
+        var sun = new GameObject("Sun").AddComponent<Light>();
+        sun.type = LightType.Directional;
+        sun.intensity = 1.15f;
+        sun.shadows = LightShadows.Soft;
+        sun.transform.rotation = Quaternion.Euler(48f, -32f, 0f);
+        var fill = new GameObject("Fill").AddComponent<Light>();
+        fill.type = LightType.Directional;
+        fill.intensity = 0.4f;
+        fill.color = new Color(0.6f, 0.7f, 1f);
+        fill.transform.rotation = Quaternion.Euler(20f, 150f, 0f);
+        RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
+        RenderSettings.ambientLight = new Color(0.4f, 0.4f, 0.5f);
+
+        GameAudio.Boot(gameObject);
+        BuildEnvironment();
+        string[] args = System.Environment.GetCommandLineArgs();
+        demo = System.Array.IndexOf(args, "-demo") >= 0;
+        demoFemale = System.Array.IndexOf(args, "-female") >= 0;
+        demoNatural = System.Array.IndexOf(args, "-natural") >= 0;
+        menuShot = System.Array.IndexOf(args, "-menushot") >= 0;
+        demoFastKo = System.Array.IndexOf(args, "-fastko") >= 0;
+        if (demo)
+        {
+            // AI vs AI in the best gear, screenshots on a timer: used to eyeball the animations without a human
+            female = demoFemale;
+            eqW = "W_0_6_3"; eqH = "H_0_3"; eqA = "A_0_3";
+            foreach (string a in args) if (a.StartsWith("-weapon=")) eqW = a.Substring(8);
+            StartFight();
+            player.autoPlay = true;
+            if (!demoNatural) { player.energy = 100f; player.dmgMul = 5f; }
+            if (demoFastKo) player.dmgMul = 8f;
+            level = 3;
+            return;
+        }
+        if (state == State.Select) ShowSelect(); else ShowMenu();
+    }
+
+    void BuildEnvironment()
+    {
+        Transform env = new GameObject("Environment").transform;
+        Fighter.Part(env, "floor", PrimitiveType.Cube, new Vector3(0, -0.5f, 2), new Vector3(40, 1, 14), new Color(0.22f, 0.2f, 0.22f), Vector3.zero);
+        Fighter.Part(env, "wall", PrimitiveType.Cube, new Vector3(0, 7, 8.5f), new Vector3(40, 16, 1), new Color(0.11f, 0.11f, 0.19f), Vector3.zero);
+        Fighter.Part(env, "moon", PrimitiveType.Sphere, new Vector3(7, 9, 8), Vector3.one * 3.2f, new Color(0.95f, 0.95f, 0.8f), Vector3.zero);
+        for (int i = -4; i <= 4; i++)
+        {
+            Fighter.Part(env, "pillar", PrimitiveType.Cylinder, new Vector3(i * 4f, 3.2f, 5.5f), new Vector3(0.95f, 3.2f, 0.95f), new Color(0.3f, 0.28f, 0.32f), Vector3.zero);
+            Fighter.Part(env, "torch", PrimitiveType.Sphere, new Vector3(i * 4f, 6.6f, 5.5f), Vector3.one * 0.5f, new Color(1f, 0.6f, 0.2f), Vector3.zero);
+            Fighter.Part(env, "stone", PrimitiveType.Cube, new Vector3(i * 4f + 2f, 0.2f, 1.2f), new Vector3(0.6f, 0.4f, 0.6f), new Color(0.3f, 0.3f, 0.33f), new Vector3(0, i * 20f, 0));
+        }
+    }
+
+    Fighter MakeFighter(string name, bool isPlayer, float x, Item w, Item h, Item a, bool fem, Color hairCol)
+    {
+        var go = new GameObject(name);
+        go.transform.position = new Vector3(x, 0, 0);
+        var f = go.AddComponent<Fighter>();
+        f.isPlayer = isPlayer;
+        f.weapon = w; f.helmet = h; f.armor = a; f.female = fem; f.hair = hairCol;
+        f.Build();
+        return f;
+    }
+
+    void ClearAll()
+    {
+        foreach (Fighter f in new[] { player, enemy, prevM, prevF }) if (f != null) Destroy(f.gameObject);
+        player = enemy = prevM = prevF = null;
+    }
+
+    void AimCam(Vector3 at, float height, float back)
+    {
+        cam.transform.position = new Vector3(at.x, height, back);
+        cam.transform.rotation = Quaternion.LookRotation(at - cam.transform.position);
+    }
+
+    // ---------- hero select ----------
+    void ShowSelect()
+    {
+        GameAudio.Music(false);
+        ClearAll();
+        state = State.Select;
+        Item w = Db.Get(eqW), h = Db.Get(eqH), a = Db.Get(eqA);
+        prevM = MakeFighter("PreviewM", false, -1.9f, w, h, a, false, Hairs[hairIdx]);
+        prevF = MakeFighter("PreviewF", false, 1.9f, w, h, a, true, Hairs[hairIdx]);
+        AimCam(new Vector3(0, 2f, 0), 2.9f, -8.5f);
+    }
+
+    void ShowMenu()
+    {
+        GameAudio.Music(false);
+        ClearAll();
+        state = State.Menu;
+        RebuildPreview();
+    }
+
+    void RebuildPreview()
+    {
+        if (player != null) Destroy(player.gameObject);
+        player = MakeFighter("Player", true, -2.2f, Db.Get(eqW), Db.Get(eqH), Db.Get(eqA), female, Hairs[hairIdx]);
+        player.yawOffset = -25f;
+        AimCam(new Vector3(-2.2f, 2f, 0), 2.9f, -7.5f);
+    }
+
+    // ---------- fight ----------
+    void StartFight()
+    {
+        GameAudio.Music(true);
+        ClearAll();
+        state = State.Fight;
+        player = MakeFighter("Player", true, -3f, Db.Get(eqW), Db.Get(eqH), Db.Get(eqA), female, Hairs[hairIdx]);
+        player.maxHp = player.hp = 300f;
+
+        enemyFaction = oppFaction < 0 ? (Faction)Random.Range(0, 4) : (Faction)oppFaction;
+        int maxTier = Mathf.Min(3, 1 + level / 2);
+        enemy = MakeFighter("Enemy", false, 3f, Pick(Slot.Weapon, maxTier), Pick(Slot.Helmet, maxTier), Pick(Slot.Armor, maxTier),
+                            Random.value < 0.5f, Hairs[Random.Range(0, Hairs.Length)]);
+        enemy.maxHp = enemy.hp = 150f + 25f * level;
+        enemy.dmgMul = Mathf.Min(3f, 0.8f + 0.08f * level);
+        enemy.aiLevel = Mathf.Min(level, 10);
+        player.target = enemy;
+        enemy.target = player;
+        round = 1; pWins = eWins = 0;
+        BeginRound();
+    }
+
+    void BeginRound()
+    {
+        player.ResetForRound(-3f);
+        enemy.ResetForRound(3f);
+        if (demo) Debug.Log("BEGIN round " + round + " energy player=" + player.energy.ToString("0.0") + " enemy=" + enemy.energy.ToString("0.0"));
+        rs = RState.Intro;
+        countdown = 2.2f;
+        roundTime = 60f;
+    }
+
+    Item Pick(Slot slot, int maxTier)
+    {
+        var list = new List<Item>();
+        foreach (var it in Db.All) if (it.slot == slot && it.faction == enemyFaction && it.tier <= maxTier) list.Add(it);
+        return list[Random.Range(0, list.Count)];
+    }
+
+    void Update()
+    {
+        if (Fighter.HitStop > 0f) { Fighter.HitStop -= Time.unscaledDeltaTime; Time.timeScale = 0.05f; }
+        else Time.timeScale = 1f;
+        float dt = Time.deltaTime;
+        if (demo) DemoTick();
+        if (menuShot && !menuShotDone && Time.realtimeSinceStartup > 6f)
+        {
+            // the game renders and saves its own frame, so nothing else on the desktop is captured
+            menuShotDone = true;
+            ScreenCapture.CaptureScreenshot((System.Environment.GetEnvironmentVariable("SA_SHOTS") ?? ".") + "/menu.png");
+        }
+        if (menuShot && Time.realtimeSinceStartup > 9f) Application.Quit();
+        if (state == State.Select)
+        {
+            if (prevM != null) prevM.yawOffset += dt * 22f;
+            if (prevF != null) prevF.yawOffset -= dt * 22f;
+        }
+        else if (state == State.Menu && player != null)
+        {
+            if (Input.GetMouseButton(0)) player.yawOffset -= Input.GetAxis("Mouse X") * 6f;
+            else player.yawOffset += dt * 12f;
+        }
+        else if (state == State.Fight)
+        {
+            if (rs == RState.Intro)
+            {
+                countdown -= dt;
+                if (countdown <= 0f) { player.controlsEnabled = enemy.controlsEnabled = true; rs = RState.Fight; }
+            }
+            else if (rs == RState.Fight)
+            {
+                roundTime -= dt;
+                bool timeUp = roundTime <= 0f;
+                if (enemy.Dead || player.Dead || timeUp)
+                {
+                    player.controlsEnabled = enemy.controlsEnabled = false;
+                    bool playerTakes = enemy.Dead != player.Dead ? enemy.Dead : player.hp / player.maxHp >= enemy.hp / enemy.maxHp;
+                    if (playerTakes) pWins++; else eWins++;
+                    lastRoundPlayer = playerTakes;
+                    if (demo) Debug.Log("KO round " + round + " energy player=" + player.energy.ToString("0.0") + " enemy=" + enemy.energy.ToString("0.0"));
+                    koText = (enemy.Dead || player.Dead) ? "K.O." : "ВРЕМЯ";
+                    rs = RState.KO;
+                    koTimer = 2.8f;
+                }
+            }
+            else
+            {
+                koTimer -= dt;
+                if (koTimer <= 0f)
+                {
+                    if (pWins >= 2 || eWins >= 2)
+                    {
+                        won = pWins >= 2;
+                        lastReward = won ? 50000L * level : 5000L;
+                        coins += lastReward;
+                        if (won) level = Mathf.Min(MaxLevel, level + 1);
+                        Save();
+                        state = State.Result;
+                    }
+                    else { round++; BeginRound(); }
+                }
+            }
+            if (Input.GetKeyDown(KeyCode.Escape)) ShowMenu();
+        }
+    }
+
+    void DemoTick()
+    {
+        demoT += Time.unscaledDeltaTime;
+        if (demoNatural && rs == RState.Fight && demoT > demoLog) { demoLog = demoT + 3f; Debug.Log("ROUND " + round + " " + rs + " ENERGY t=" + demoT.ToString("0.0") + " player=" + player.energy.ToString("0.0") + " enemy=" + enemy.energy.ToString("0.0")); }
+        if (!demoNatural && player != null && rs == RState.Fight && player.energy < 100f && Mathf.FloorToInt(demoT) % 4 == 0) player.energy = 100f;
+        if (demoT > 3f + demoShots * 0.6f && demoShots < 60)
+        {
+            string dir = System.Environment.GetEnvironmentVariable("SA_SHOTS") ?? ".";
+            ScreenCapture.CaptureScreenshot(dir + "/demo_" + (demoFemale ? "f" : "m") + "_" + demoShots + ".png");
+            demoShots++;
+        }
+        if (demoT > 44f) Application.Quit();
+        if (state == State.Result) StartFight();
+    }
+
+    void LateUpdate()
+    {
+        if (state != State.Fight && state != State.Result) return;
+        if (player == null || enemy == null) return;
+        float mid = (player.transform.position.x + enemy.transform.position.x) * 0.5f;
+        float sep = Mathf.Abs(player.transform.position.x - enemy.transform.position.x);
+        Vector3 pos = new Vector3(mid * 0.6f, 3f, -9f - sep * 0.4f);
+        cam.transform.position = Vector3.Lerp(cam.transform.position, pos, Time.deltaTime * 4f);
+        Quaternion rot = Quaternion.LookRotation(new Vector3(mid * 0.6f, 2.1f, 0f) - cam.transform.position);
+        cam.transform.rotation = Quaternion.Slerp(cam.transform.rotation, rot, Time.deltaTime * 4f);
+        if (Fighter.Shake > 0f)
+        {
+            cam.transform.position += Random.insideUnitSphere * Fighter.Shake;
+            Fighter.Shake = Mathf.MoveTowards(Fighter.Shake, 0f, Time.unscaledDeltaTime * 1.2f);
+        }
+    }
+
+    // ---------- UI helpers ----------
+    void Rect(float x, float y, float w, float h, Color c)
+    {
+        GUI.color = c;
+        GUI.DrawTexture(new UnityEngine.Rect(x, y, w, h), white);
+        GUI.color = Color.white;
+    }
+
+    void Bar(float x, float y, float w, float h, float frac, Color c)
+    {
+        Rect(x - 2, y - 2, w + 4, h + 4, new Color(0.7f, 0.65f, 0.4f, 0.9f));
+        Rect(x, y, w, h, new Color(0.05f, 0.05f, 0.05f, 0.95f));
+        Rect(x + 2, y + 2, (w - 4) * Mathf.Clamp01(frac), h - 4, c);
+    }
+
+    string OppLabel()
+    {
+        return oppFaction < 0 ? OppNames[0] : "<color=#" + Hex((Faction)oppFaction) + ">" + OppNames[oppFaction + 1] + "</color>";
+    }
+
+    static string Hex(Faction f) { return ColorUtility.ToHtmlStringRGB(Db.FactionColor(f)); }
+
+    void OnGUI()
+    {
+        float s = Screen.height / 720f;
+        GUI.matrix = Matrix4x4.Scale(new Vector3(s, s, 1));
+        float vw = Screen.width / s;
+        GUI.skin.label.fontSize = 16;
+        GUI.skin.label.richText = true;
+        GUI.skin.button.fontSize = 18;
+        GUI.skin.button.richText = true;
+
+        var big = new GUIStyle(GUI.skin.label) { fontSize = 48, alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold };
+        var mid = new GUIStyle(GUI.skin.label) { fontSize = 22, alignment = TextAnchor.MiddleCenter };
+
+        switch (state)
+        {
+            case State.Select: SelectGui(vw, big, mid); break;
+            case State.Menu: MenuGui(vw, big, mid); break;
+            case State.Shop: ShopGui(vw); break;
+            case State.Fight: FightGui(vw, s, big, mid); break;
+            case State.Result: ResultGui(vw, big, mid); break;
+        }
+    }
+
+    void SelectGui(float vw, GUIStyle big, GUIStyle mid)
+    {
+        GUI.Label(new UnityEngine.Rect(0, 30, vw, 70), "КОГО ОДЕВАЕМ?", big);
+        GUI.Label(new UnityEngine.Rect(0, 100, vw, 40), "Выбери героя — дальше закупим ему экипировку", mid);
+        float cx = vw / 2f;
+        if (GUI.Button(new UnityEngine.Rect(cx - 330, 560, 300, 70), "МАЛЬЧИК")) { female = false; Save(); ShowMenu(); }
+        if (GUI.Button(new UnityEngine.Rect(cx + 30, 560, 300, 70), "ДЕВОЧКА")) { female = true; Save(); ShowMenu(); }
+        if (GUI.Button(new UnityEngine.Rect(cx - 150, 645, 300, 50), "Цвет волос"))
+        {
+            hairIdx = (hairIdx + 1) % Hairs.Length;
+            ShowSelect();
+        }
+    }
+
+    void MenuGui(float vw, GUIStyle big, GUIStyle mid)
+    {
+        Item w = Db.Get(eqW), h = Db.Get(eqH), a = Db.Get(eqA);
+        GUI.Label(new UnityEngine.Rect(vw - 520, 26, 500, 70), "SHADOW <color=#c040ff>ARENA</color>", big);
+        GUI.Label(new UnityEngine.Rect(vw - 520, 100, 500, 40), "Монеты: <color=#ffd040>" + coins.ToString("N0") + "</color>", mid);
+        GUI.Label(new UnityEngine.Rect(vw - 520, 136, 500, 40), "Противник: " + OppLabel() + "  ·  ур. " + level, mid);
+        if (GUI.Button(new UnityEngine.Rect(vw - 420, 200, 300, 70), "В БОЙ")) StartFight();
+        if (GUI.Button(new UnityEngine.Rect(vw - 420, 285, 300, 70), "ОРУЖЕЙНАЯ")) { state = State.Shop; scroll = Vector2.zero; }
+        if (GUI.Button(new UnityEngine.Rect(vw - 420, 370, 145, 50), "Сменить\nгероя")) ShowSelect();
+        if (GUI.Button(new UnityEngine.Rect(vw - 265, 370, 145, 50), "Цвет\nволос"))
+        {
+            hairIdx = (hairIdx + 1) % Hairs.Length;
+            Save();
+            RebuildPreview();
+        }
+        if (GUI.Button(new UnityEngine.Rect(vw - 420, 435, 300, 50), "+100 000 000 монет")) { coins += 100000000L; Save(); }
+
+        // choose who you fight and how strong they are
+        var small = new GUIStyle(mid) { fontSize = 17 };
+        GUI.Label(new UnityEngine.Rect(vw - 430, 498, 320, 24), "<b>ВЫБОР ПРОТИВНИКА</b>", small);
+        if (GUI.Button(new UnityEngine.Rect(vw - 430, 528, 44, 42), "<")) { oppFaction = oppFaction <= -1 ? 3 : oppFaction - 1; Save(); }
+        GUI.Label(new UnityEngine.Rect(vw - 384, 528, 228, 42), OppLabel(), small);
+        if (GUI.Button(new UnityEngine.Rect(vw - 152, 528, 44, 42), ">")) { oppFaction = oppFaction >= 3 ? -1 : oppFaction + 1; Save(); }
+        if (GUI.Button(new UnityEngine.Rect(vw - 430, 578, 44, 42), "-5")) { level = Mathf.Max(1, level - 5); Save(); }
+        if (GUI.Button(new UnityEngine.Rect(vw - 384, 578, 40, 42), "-")) { level = Mathf.Max(1, level - 1); Save(); }
+        GUI.Label(new UnityEngine.Rect(vw - 340, 578, 132, 42), "Уровень " + level, small);
+        if (GUI.Button(new UnityEngine.Rect(vw - 204, 578, 40, 42), "+")) { level = Mathf.Min(MaxLevel, level + 1); Save(); }
+        if (GUI.Button(new UnityEngine.Rect(vw - 160, 578, 52, 42), "+5")) { level = Mathf.Min(MaxLevel, level + 5); Save(); }
+
+        Rect(16, 16, 400, 176, new Color(0, 0, 0, 0.65f));
+        GUI.Label(new UnityEngine.Rect(30, 24, 380, 30), (female ? "<b>ДЕВОЧКА</b>" : "<b>МАЛЬЧИК</b>") + "   ур. " + level);
+        GUI.Label(new UnityEngine.Rect(30, 56, 380, 30), "Оружие: <color=#" + Hex(w.faction) + ">" + w.name + "</color>");
+        GUI.Label(new UnityEngine.Rect(30, 84, 380, 30), "Шлем: <color=#" + Hex(h.faction) + ">" + h.name + "</color>");
+        GUI.Label(new UnityEngine.Rect(30, 112, 380, 30), "Броня: <color=#" + Hex(a.faction) + ">" + a.name + "</color>");
+        GUI.Label(new UnityEngine.Rect(30, 148, 380, 30), "УРОН " + w.damage + "    ЗАЩИТА " + (h.defense + a.defense));
+        GUI.Label(new UnityEngine.Rect(16, 686, vw, 30), "ЛКМ + движение мышью — покрутить героя");
+    }
+
+    void ShopGui(float vw)
+    {
+        Rect(vw - 560, 0, 560, 720, new Color(0, 0, 0, 0.78f));
+        GUILayout.BeginArea(new UnityEngine.Rect(vw - 550, 10, 540, 700));
+        GUILayout.Label("Монеты: <color=#ffd040>" + coins.ToString("N0") + "</color>   ·   одеваем: " + (female ? "девочку" : "мальчика"));
+        GUILayout.BeginHorizontal();
+        string[] tn = { "Оружие", "Шлемы", "Броня" };
+        for (int i = 0; i < 3; i++) if (GUILayout.Button(tn[i], GUILayout.Height(40))) { tab = (Slot)i; scroll = Vector2.zero; }
+        GUILayout.EndHorizontal();
+        GUILayout.BeginHorizontal();
+        if (GUILayout.Button("Все", GUILayout.Height(34))) factionFilter = -1;
+        for (int f = 0; f < 4; f++)
+            if (GUILayout.Button("<color=#" + Hex((Faction)f) + ">" + (Faction)f + "</color>", GUILayout.Height(34))) factionFilter = f;
+        GUILayout.EndHorizontal();
+
+        if (factionFilter >= 0) GUILayout.Label("<i>" + (Faction)factionFilter + " — " + Db.Trait((Faction)factionFilter) + "</i>");
+        scroll = GUILayout.BeginScrollView(scroll, GUILayout.Height(520));
+        foreach (Item it in Db.All)
+        {
+            if (it.slot != tab || (factionFilter >= 0 && (int)it.faction != factionFilter)) continue;
+            bool have = owned.Contains(it.id);
+            bool eq = it.id == eqW || it.id == eqH || it.id == eqA;
+            GUILayout.BeginHorizontal(GUI.skin.box);
+            string stats = it.slot == Slot.Weapon
+                ? "УРОН " + it.damage + "  ДЛИНА " + it.reach + "  СКОР " + it.speed + "  КРИТ " + Mathf.Round(it.crit * 100f) + "%"
+                : "ЗАЩИТА " + it.defense;
+            GUILayout.Label("<b><color=#" + Hex(it.faction) + ">" + it.name + "</color></b>\n" + it.faction + " · " + stats, GUILayout.Width(330));
+            string label = eq ? "НАДЕТО" : have ? "Надеть" : "Купить\n" + it.price.ToString("N0");
+            GUI.enabled = !eq && (have || coins >= it.price);
+            if (GUILayout.Button(label, GUILayout.Width(150), GUILayout.Height(54))) BuyOrEquip(it, have);
+            GUI.enabled = true;
+            GUILayout.EndHorizontal();
+        }
+        GUILayout.EndScrollView();
+        if (GUILayout.Button("Назад", GUILayout.Height(40))) ShowMenu();
+        GUILayout.EndArea();
+    }
+
+    void BuyOrEquip(Item it, bool have)
+    {
+        if (!have) { coins -= it.price; owned.Add(it.id); }
+        if (it.slot == Slot.Weapon) eqW = it.id;
+        else if (it.slot == Slot.Helmet) eqH = it.id;
+        else eqA = it.id;
+        Save();
+        RebuildPreview();
+    }
+
+    void HeadBar(Fighter f, float s, Color c)
+    {
+        Vector3 sp = cam.WorldToScreenPoint(f.transform.position + new Vector3(0, f.headY, 0));
+        if (sp.z <= 0) return;
+        float x = sp.x / s - 60f, y = (Screen.height - sp.y) / s - 24f;
+        Bar(x, y, 120, 12, f.hp / f.maxHp, c);
+    }
+
+    void FightGui(float vw, float s, GUIStyle big, GUIStyle mid)
+    {
+        Rect(0, 0, vw, 92, new Color(0, 0, 0, 0.45f));
+        GUI.Label(new UnityEngine.Rect(24, 8, 500, 26), "<b>" + (female ? "ДЕВОЧКА" : "МАЛЬЧИК") + "</b>   " + Db.Get(eqW).name);
+        Bar(24, 36, 480, 26, player.hp / player.maxHp, new Color(0.25f, 0.85f, 0.35f));
+        Bar(24, 68, 300, 12, player.energy / 100f, new Color(0.75f, 0.35f, 1f));
+        GUI.Label(new UnityEngine.Rect(332, 62, 300, 24), player.energy >= 100f ? "<color=#ff80ff><b>СУПЕР: " + player.PowerName + " (I)</b></color>" : "суперсила " + Mathf.Floor(player.energy) + "%");
+
+        var right = new GUIStyle(GUI.skin.label) { fontSize = 16, richText = true, alignment = TextAnchor.MiddleRight };
+        GUI.Label(new UnityEngine.Rect(vw - 524, 8, 500, 26), "<b><color=#" + Hex(enemyFaction) + ">" + enemyFaction + "</color></b>   " + enemy.weapon.name + "   ур. " + level, right);
+        Bar(vw - 504, 36, 480, 26, enemy.hp / enemy.maxHp, new Color(0.9f, 0.27f, 0.22f));
+        Bar(vw - 504, 68, 300, 12, enemy.energy / 100f, new Color(0.75f, 0.35f, 1f));
+
+        HeadBar(player, s, new Color(0.25f, 0.85f, 0.35f));
+        HeadBar(enemy, s, new Color(0.9f, 0.27f, 0.22f));
+
+        var tm = new GUIStyle(GUI.skin.label) { fontSize = 38, alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, richText = true };
+        GUI.Label(new UnityEngine.Rect(vw / 2 - 60, 6, 120, 50), Mathf.CeilToInt(Mathf.Max(0f, roundTime)).ToString(), tm);
+        GUI.Label(new UnityEngine.Rect(vw / 2 - 80, 52, 160, 24), "раунд " + round + " из 3", new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter });
+        for (int i = 0; i < 2; i++)
+        {
+            Rect(vw / 2 - 74 - i * 26, 78, 20, 10, i < pWins ? new Color(1f, 0.85f, 0.2f) : new Color(0.2f, 0.2f, 0.2f, 0.9f));
+            Rect(vw / 2 + 54 + i * 26, 78, 20, 10, i < eWins ? new Color(1f, 0.85f, 0.2f) : new Color(0.2f, 0.2f, 0.2f, 0.9f));
+        }
+        Rect(0, 664, vw, 56, new Color(0, 0, 0, 0.55f));
+        GUI.Label(new UnityEngine.Rect(20, 668, vw, 24),
+            "A/D ход · W прыжок · <b>U</b> рука (жми ещё: джеб-кросс-апперкот) · <b>H</b> нога (ещё: раундхаус) · <b>S+H</b> подсечка · в прыжке H — удар ногой");
+        GUI.Label(new UnityEngine.Rect(20, 692, vw, 24),
+            "<b>J</b>/ЛКМ рубящий · <b>K</b>/ПКМ тяжёлый удар оружием · <b>L</b> блок (подсечку не блочит) · <b>I</b> суперсила: пламя / молния / свет / тьма · Esc меню");
+        if (rs == RState.Intro)
+        {
+            string t = countdown > 0.7f ? (pWins == 1 && eWins == 1 ? "ФИНАЛЬНЫЙ РАУНД" : "РАУНД " + round) : "БОЙ!";
+            GUI.Label(new UnityEngine.Rect(0, 250, vw, 100), t, big);
+        }
+        else if (rs == RState.KO)
+        {
+            GUI.Label(new UnityEngine.Rect(0, 200, vw, 120), "<color=#ff5040>" + koText + "</color>", new GUIStyle(big) { fontSize = 84, richText = true });
+            string who = lastRoundPlayer
+                ? "<color=#60ff80>РАУНД " + round + " — ТЫ ПОБЕДИЛ!</color>"
+                : "<color=#ff6060>РАУНД " + round + " — ПОБЕДИЛ ПРОТИВНИК</color>";
+            Rect(vw / 2 - 320, 320, 640, 64, new Color(0, 0, 0, 0.6f));
+            GUI.Label(new UnityEngine.Rect(0, 326, vw, 36), who, new GUIStyle(mid) { fontSize = 30, fontStyle = FontStyle.Bold, richText = true });
+            GUI.Label(new UnityEngine.Rect(0, 360, vw, 26), "счёт по раундам  " + pWins + " : " + eWins, mid);
+        }
+    }
+
+    void ResultGui(float vw, GUIStyle big, GUIStyle mid)
+    {
+        Rect(0, 180, vw, 200, new Color(0, 0, 0, 0.6f));
+        GUI.Label(new UnityEngine.Rect(0, 200, vw, 100), won ? "<color=#60ff80>ПОБЕДА</color>" : "<color=#ff6060>ПОРАЖЕНИЕ</color>", big);
+        GUI.Label(new UnityEngine.Rect(0, 290, vw, 40), "Раунды " + pWins + " : " + eWins + "   ·   +" + lastReward.ToString("N0") + " монет", mid);
+        if (GUI.Button(new UnityEngine.Rect(vw / 2 - 150, 400, 300, 60), "Ещё бой")) StartFight();
+        if (GUI.Button(new UnityEngine.Rect(vw / 2 - 150, 475, 300, 60), "В меню")) ShowMenu();
+    }
+}

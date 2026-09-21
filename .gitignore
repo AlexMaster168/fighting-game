@@ -1,0 +1,27 @@
+# Unity generated
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+
+# Builds
+/[Bb]uild/
+/[Bb]uilds/
+
+# Logs and IDE
+*.log
+.vs/
+.vscode/
+*.csproj
+*.sln
+*.suo
+*.user
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# OS
+.DS_Store
+Thumbs.db
