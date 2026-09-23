@@ -44,6 +44,25 @@ public static class Builder
             EditorApplication.Exit(sum.result == BuildResult.Succeeded ? 0 : 1);
     }
 
+    // Arenas turn fog on at runtime; by default Unity strips fog shader variants the scenes do not use.
+    static void KeepFogVariants()
+    {
+        var gs = AssetDatabase.LoadAssetAtPath<Object>("ProjectSettings/GraphicsSettings.asset");
+        if (gs == null) { Debug.LogWarning("GraphicsSettings not found, fog may be stripped"); return; }
+        var so = new SerializedObject(gs);
+        var strip = so.FindProperty("m_FogStripping");
+        if (strip != null) strip.intValue = 1;   // custom
+        int kept = 0;
+        foreach (string n in new[] { "m_FogKeepLinear", "m_FogKeepExp", "m_FogKeepExp2" })
+        {
+            var q = so.FindProperty(n);
+            if (q != null) { q.boolValue = true; kept++; }
+        }
+        so.ApplyModifiedPropertiesWithoutUndo();
+        AssetDatabase.SaveAssets();
+        Debug.Log("FOG variants kept: stripping=" + (strip != null) + " modes=" + kept);
+    }
+
     // The game builds itself from code, so the player only needs one scene plus a material
     // asset that pins the shader into the build (Shader.Find alone would not include it).
     static void EnsureAssets()
@@ -56,6 +75,19 @@ public static class Builder
             var mat = new Material(sh) { color = Color.white };
             AssetDatabase.CreateAsset(mat, MatPath);
         }
+
+        // emissive material keeps the _EMISSION variant; the trail material pulls Sprites/Default into the build
+        if (AssetDatabase.LoadAssetAtPath<Material>(ResDir + "/GlowMat.mat") == null)
+        {
+            var g = new Material(Shader.Find("Standard")) { color = Color.white };
+            g.EnableKeyword("_EMISSION");
+            g.SetColor("_EmissionColor", Color.white);
+            g.globalIlluminationFlags = MaterialGlobalIlluminationFlags.None;
+            AssetDatabase.CreateAsset(g, ResDir + "/GlowMat.mat");
+        }
+        if (AssetDatabase.LoadAssetAtPath<Material>(ResDir + "/TrailMat.mat") == null)
+            AssetDatabase.CreateAsset(new Material(Shader.Find("Sprites/Default")), ResDir + "/TrailMat.mat");
+        KeepFogVariants();
 
         if (!Directory.Exists(SceneDir)) Directory.CreateDirectory(SceneDir);
         if (!File.Exists(ScenePath))

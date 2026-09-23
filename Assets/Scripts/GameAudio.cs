@@ -10,10 +10,11 @@ public class GameAudio : MonoBehaviour
 
     static GameAudio inst;
     AudioSource music, sfx, voice;
-    AudioClip fightClip, menuClip;
+    AudioClip menuClip;
+    readonly AudioClip[] arenaClips = new AudioClip[5];
+    int playing = -2;
     readonly Dictionary<string, AudioClip> fx = new Dictionary<string, AudioClip>();
     readonly System.Random rng = new System.Random(7);
-    bool fightPlaying;
     bool muted;
 
     public static void Boot(GameObject host)
@@ -56,7 +57,6 @@ public class GameAudio : MonoBehaviour
         voice = gameObject.AddComponent<AudioSource>();
         voice.spatialBlend = 0f;
 
-        fightClip = MakeFight();
         menuClip = MakeMenu();
         fx["hit"] = MakeHit(false);
         fx["hit2"] = MakeHit(true);
@@ -87,7 +87,7 @@ public class GameAudio : MonoBehaviour
         Debug.Log("AUDIO voices loaded " + loaded + "/12");
         Debug.Log("AUDIO pain male " + Pitch(fx["pm_l0"]).ToString("0") + "Hz/" + Pitch(fx["pm_h1"]).ToString("0") + "Hz  female " + Pitch(fx["pf_l0"]).ToString("0") + "Hz/" + Pitch(fx["pf_h1"]).ToString("0")
                   + "Hz  peaks " + Stats(fx["pm_h0"]) + " | " + Stats(fx["pf_h0"]));
-        Debug.Log("AUDIO fight " + Stats(fightClip) + " | menu " + Stats(menuClip));
+        Debug.Log("AUDIO menu " + Stats(menuClip));
         SwitchMusic(false);
     }
 
@@ -102,10 +102,30 @@ public class GameAudio : MonoBehaviour
 
     void SwitchMusic(bool fight)
     {
-        if (music.isPlaying && fightPlaying == fight) return;
-        fightPlaying = fight;
-        music.clip = fight ? fightClip : menuClip;
-        music.volume = fight ? 0.5f : 0.4f;
+        if (fight) { PlayArena(0); return; }
+        if (playing == -1 && music.isPlaying) return;
+        playing = -1;
+        music.clip = menuClip;
+        music.volume = 0.4f;
+        music.Play();
+    }
+
+    // each arena has its own track, synthesised the first time it is needed
+    public static void MusicArena(int idx) { if (inst != null) inst.PlayArena(idx); }
+
+    void PlayArena(int idx)
+    {
+        idx = Mathf.Clamp(idx, 0, arenaClips.Length - 1);
+        if (playing == idx && music.isPlaying) return;
+        if (arenaClips[idx] == null)
+        {
+            float t0 = Time.realtimeSinceStartup;
+            arenaClips[idx] = MakeTrack(idx);
+            Debug.Log("AUDIO track " + idx + " " + Stats(arenaClips[idx]) + " built in " + (Time.realtimeSinceStartup - t0).ToString("0.00") + "s");
+        }
+        playing = idx;
+        music.clip = arenaClips[idx];
+        music.volume = 0.5f;
         music.Play();
     }
 
@@ -147,75 +167,194 @@ public class GameAudio : MonoBehaviour
         }
     }
 
-    // ---------- fight track: 150 BPM, A minor, 8 bars ----------
-    AudioClip MakeFight()
+    // ---------- arena tracks: 16 bars each, intro / main theme / climax ----------
+    class Track
     {
-        const float bpm = 150f;
-        float beat = 60f / bpm, step = beat / 4f;
-        int bars = 8, steps = bars * 16;
-        var buf = new float[(int)(steps * step * SR)];
+        public float bpm, pad, leadAmp;
+        public int key, lead, drums, bass;
+        public int[] roots, thirds;
+        public int[][] riff;
+    }
 
-        // A  F  G  E  chord roots (semitones from A) and their minor/major thirds
-        int[] roots = { 0, -4, -2, -5 };
-        int[] thirds = { 3, 4, 4, 4 };
-        // lead riff: A minor pentatonic degrees (semitones above A3), -1 = rest
-        int[][] riff =
+    static Track TrackDef(int idx)
+    {
+        switch (idx)
         {
-            new[] { 0, -1, -1, 3, -1, 5, -1, 3, 0, -1, 7, -1, 5, -1, 3, -1 },
-            new[] { 0, -1, 3, -1, 5, -1, 7, -1, 10, -1, 7, -1, 5, -1, 3, -1 },
-            new[] { 12, -1, 10, -1, 7, -1, 10, 12, -1, 10, -1, 7, -1, 5, 3, -1 },
-            new[] { 7, -1, 7, 5, -1, 3, -1, 0, -1, -1, 3, -1, 5, -1, -1, -1 },
-        };
+            case 0: // Colosseum: heroic brass and war drums, D minor
+                return new Track { bpm = 136, key = 5, lead = 1, drums = 1, bass = 0, pad = 0.08f, leadAmp = 0.14f,
+                    roots = new[] { 0, -4, -2, -5 }, thirds = new[] { 3, 4, 4, 4 },
+                    riff = new[] {
+                        new[] { 0, -1, -1, 0, 3, -1, 7, -1, 5, -1, 3, -1, 2, -1, -1, -1 },
+                        new[] { 0, -1, -1, 0, 3, -1, 7, -1, 10, -1, 8, -1, 7, -1, -1, -1 },
+                        new[] { 12, -1, 10, -1, 8, -1, 7, -1, 8, -1, 10, -1, 12, -1, -1, -1 },
+                        new[] { 7, -1, 5, -1, 3, -1, 2, -1, 3, -1, -1, 2, 0, -1, -1, -1 } } };
+            case 1: // Bamboo temple: koto pluck and taiko, E pentatonic
+                return new Track { bpm = 116, key = 7, lead = 2, drums = 2, bass = 1, pad = 0.06f, leadAmp = 0.22f,
+                    roots = new[] { 0, -2, -4, -2 }, thirds = new[] { 3, 4, 4, 4 },
+                    riff = new[] {
+                        new[] { 12, -1, 10, -1, 7, -1, -1, -1, 5, -1, 7, -1, -1, -1, -1, -1 },
+                        new[] { 10, -1, 12, -1, 15, -1, 12, -1, 10, -1, 7, -1, -1, -1, -1, -1 },
+                        new[] { 7, -1, 5, -1, 3, -1, 5, -1, 7, -1, 10, -1, 12, -1, -1, -1 },
+                        new[] { 15, -1, 12, 10, -1, -1, 7, -1, 5, -1, 3, -1, 0, -1, -1, -1 } } };
+            case 2: // Sky sanctum: bells over a light groove, C major
+                return new Track { bpm = 108, key = 3, lead = 3, drums = 3, bass = 2, pad = 0.09f, leadAmp = 0.2f,
+                    roots = new[] { 0, 5, 7, -3 }, thirds = new[] { 4, 4, 4, 3 },
+                    riff = new[] {
+                        new[] { 0, -1, 4, -1, 7, -1, 11, -1, 12, -1, -1, -1, 11, -1, 7, -1 },
+                        new[] { 9, -1, 7, -1, 4, -1, 7, -1, 5, -1, -1, -1, 4, -1, 2, -1 },
+                        new[] { 0, -1, 4, -1, 7, -1, 12, -1, 14, -1, -1, -1, 12, -1, 11, -1 },
+                        new[] { 9, -1, 11, -1, 12, -1, -1, -1, 7, -1, -1, -1, -1, -1, -1, -1 } } };
+            case 3: // Shadow crypt: drone and eerie voice, F# phrygian
+                return new Track { bpm = 90, key = -3, lead = 4, drums = 4, bass = 3, pad = 0.1f, leadAmp = 0.16f,
+                    roots = new[] { 0, 1, 0, -2 }, thirds = new[] { 3, 3, 3, 3 },
+                    riff = new[] {
+                        new[] { 0, -1, -1, -1, -1, -1, -1, -1, 1, -1, -1, -1, -1, -1, -1, -1 },
+                        new[] { 3, -1, -1, -1, -1, -1, 1, -1, 0, -1, -1, -1, -1, -1, -1, -1 },
+                        new[] { 7, -1, -1, -1, 8, -1, -1, -1, 7, -1, -1, -1, 5, -1, -1, -1 },
+                        new[] { 3, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, -1 } } };
+            default: // Volcano: fast metal, E minor
+                return new Track { bpm = 168, key = 7, lead = 5, drums = 0, bass = 4, pad = 0.04f, leadAmp = 0.12f,
+                    roots = new[] { 0, 0, -4, -2 }, thirds = new[] { 3, 3, 4, 4 },
+                    riff = new[] {
+                        new[] { 0, 0, 12, 0, 0, 10, 0, 0, 7, 0, 6, 0, 5, 0, 3, 0 },
+                        new[] { 0, 0, 12, 0, 0, 10, 0, 0, 7, -1, 8, -1, 7, -1, 6, -1 },
+                        new[] { 12, -1, 10, -1, 12, -1, 15, -1, 13, -1, 12, -1, 10, -1, 8, -1 },
+                        new[] { 7, -1, 6, -1, 5, -1, 3, -1, 0, -1, -1, -1, 12, -1, -1, -1 } } };
+        }
+    }
 
+    AudioClip MakeTrack(int idx)
+    {
+        Track d = TrackDef(idx);
+        float step = 60f / d.bpm / 4f;
+        int bars = 16, steps = bars * 16;
+        var buf = new float[(int)(steps * step * SR)];
+        float[] leadLen = { 1.8f, 1.8f, 3f, 4f, 6f, 0.9f };
+        float[] leadDecay = { 0.35f, 0.5f, 0.25f, 0.7f, 1.2f, 0.25f };
         for (int s = 0; s < steps; s++)
         {
-            int bar = s / 16, st = s % 16;
+            int bar = s / 16, st = s % 16, chord = bar % 4;
+            int sec = bar < 4 ? 0 : bar < 12 ? 1 : 2;
             float t0 = s * step;
-            int chord = bar % 4;
-
-            // drums
-            if (st == 0 || st == 8 || (st == 6 && bar % 2 == 1) || (st == 14 && bar % 4 == 3))
-                Note(buf, t0, 0.22f, (f, t) => Sin(45f * t + (75f / 22f) * (1f - Mathf.Exp(-t * 22f))), 1f, 0.95f, 0.09f);
-            if (st == 4 || st == 12)
-            {
-                Note(buf, t0, 0.2f, (f, t) => N() * 0.9f, 1f, 0.55f, 0.07f);
-                Note(buf, t0, 0.15f, (f, t) => Sin(185f * t), 1f, 0.45f, 0.05f);
-            }
-            if (st % 2 == 0) Note(buf, t0, 0.06f, (f, t) => N(), 1f, st % 4 == 2 ? 0.16f : 0.09f, 0.02f);
-            if (st == 14) Note(buf, t0, 0.18f, (f, t) => N(), 1f, 0.12f, 0.08f);
-
-            // bass: driving eighths, octave jumps
-            if (st % 2 == 0)
-            {
-                int oct = (st == 6 || st == 14) ? 12 : 0;
-                float f0 = Hz(roots[chord] + oct);
-                Note(buf, t0, step * 1.9f, (f, t) => Sin(f * t) * 0.7f + Saw(f * t) * 0.35f, f0, 0.5f, 0.25f);
-            }
-
-            // pad: sustained triad, quiet
+            Drums(d.drums, buf, t0, st, bar, sec);
+            Bass(d.bass, buf, t0, st, Hz(d.roots[chord] + d.key), step);
             if (st == 0)
+                foreach (int semi in new[] { 24, 24 + d.thirds[chord], 31 })
+                    Note(buf, t0, step * 16f, (f, t) => Sin(f * t) * 0.6f + Sin(f * 1.004f * t) * 0.4f, Hz(d.roots[chord] + d.key + semi), d.pad, 3f);
+            if (sec >= 1)
             {
-                float len = step * 16f;
-                foreach (int semi in new[] { roots[chord] + 24, roots[chord] + 24 + thirds[chord], roots[chord] + 31 })
-                    Note(buf, t0, len, (f, t) => Sin(f * t) * 0.6f + Sin(f * 1.004f * t) * 0.4f, Hz(semi), 0.07f, 3f);
-            }
-
-            // lead comes in from bar 3 for the build-up
-            if (bar >= 2)
-            {
-                int deg = riff[bar % 4][st];
+                int deg = d.riff[bar % 4][st];
                 if (deg >= 0)
                 {
-                    float f0 = Hz(deg + 24);
-                    Note(buf, t0, step * 1.8f, (f, t) =>
-                    {
-                        float vib = 1f + 0.006f * Mathf.Sin(t * 40f);
-                        return Sq(f * vib * t) * 0.5f + Saw(f * 1.005f * vib * t) * 0.4f;
-                    }, f0, 0.16f, 0.35f);
+                    int type = d.lead;
+                    Note(buf, t0, step * leadLen[type], (f, t) => LeadOsc(type, f, t), Hz(deg + 24 + d.key), d.leadAmp, leadDecay[type]);
+                    if (sec == 2) Note(buf, t0, step * leadLen[type], (f, t) => LeadOsc(type, f, t), Hz(deg + 31 + d.key), d.leadAmp * 0.5f, leadDecay[type]);
                 }
             }
         }
-        return ToClip("fightMusic", buf, 1.15f);
+        return ToClip("arena" + idx, buf, 1.1f);
+    }
+
+    float LeadOsc(int type, float f, float t)
+    {
+        switch (type)
+        {
+            case 1: // brass
+            {
+                float vib = 1f + 0.005f * Mathf.Sin(t * 35f);
+                return (Saw(f * vib * t) * 0.6f + Saw(f * 1.006f * vib * t) * 0.4f) * Mathf.Min(1f, t / 0.03f);
+            }
+            case 2: return Sin(f * t) * 0.7f + Sin(f * 2f * t) * 0.3f * Mathf.Exp(-t * 12f);          // koto pluck
+            case 3: return Sin(f * t) * 0.7f + Sin(f * 2.76f * t) * 0.3f * Mathf.Exp(-t * 6f);        // bell
+            case 4:                                                                                   // eerie voice
+            {
+                float vib = 1f + 0.012f * Mathf.Sin(t * 9f);
+                return Sin(f * vib * t) * 0.6f + Sin(f * 0.5f * t) * 0.25f + Sin(f * 1.01f * vib * t) * 0.3f;
+            }
+            case 5: return (float)Math.Tanh((Saw(f * t) + Saw(f * 1.498f * t) + Saw(f * 0.5f * t) * 0.7f) * 2.2f) * 0.6f;   // power chord
+            default: return Sq(f * t) * 0.5f + Saw(f * 1.005f * t) * 0.4f;
+        }
+    }
+
+    void Kick(float[] b, float t0, float amp, float decay)
+    {
+        Note(b, t0, 0.3f, (f, t) => Sin(45f * t + (75f / 22f) * (1f - Mathf.Exp(-t * 22f))), 1f, amp, decay);
+    }
+
+    void Snare(float[] b, float t0, float amp)
+    {
+        Note(b, t0, 0.2f, (f, t) => N() * 0.9f, 1f, amp, 0.07f);
+        Note(b, t0, 0.15f, (f, t) => Sin(185f * t), 1f, amp * 0.8f, 0.05f);
+    }
+
+    void Hat(float[] b, float t0, float amp, float decay)
+    {
+        Note(b, t0, 0.06f, (f, t) => N(), 1f, amp, decay);
+    }
+
+    void Tom(float[] b, float t0, float f0, float amp, float decay)
+    {
+        Note(b, t0, 0.5f, (f, t) => Sin(f0 * t + (f0 * 0.8f / 15f) * (1f - Mathf.Exp(-t * 15f))), 1f, amp, decay);
+    }
+
+    void Drums(int style, float[] b, float t0, int st, int bar, int sec)
+    {
+        bool fill = bar % 4 == 3 && st >= 12;
+        switch (style)
+        {
+            case 0: // metal: double kick
+                if (st % 2 == 0 || sec == 2) Kick(b, t0, 0.8f, 0.06f);
+                if (st == 4 || st == 12) Snare(b, t0, 0.6f);
+                Hat(b, t0, st % 2 == 0 ? 0.12f : 0.07f, 0.02f);
+                if (fill) Snare(b, t0, 0.35f);
+                break;
+            case 1: // war drums
+                if (st == 0 || st == 8 || st == 10) Kick(b, t0, 0.95f, 0.09f);
+                if (st == 3 || st == 6 || st == 11 || st == 14) Tom(b, t0, 95f, 0.5f, 0.12f);
+                if (st == 4 || st == 12) Snare(b, t0, 0.5f);
+                if (fill || (sec == 2 && st % 2 == 1)) Snare(b, t0, 0.25f);
+                if (st % 4 == 2) Hat(b, t0, 0.07f, 0.02f);
+                break;
+            case 2: // taiko
+                if (st == 0 || st == 10) Tom(b, t0, 60f, 0.95f, 0.3f);
+                if (st == 6 || st == 12 || st == 14) Tom(b, t0, 110f, 0.55f, 0.14f);
+                if (st == 4 || st == 12) Hat(b, t0, 0.18f, 0.012f);
+                if (fill) Tom(b, t0, 85f, 0.45f, 0.1f);
+                break;
+            case 3: // light groove
+                if (st == 0 || st == 8) Kick(b, t0, 0.55f, 0.09f);
+                if (st == 4 || st == 12) Snare(b, t0, 0.28f);
+                Hat(b, t0, st % 2 == 0 ? 0.06f : 0.035f, 0.015f);
+                break;
+            default: // sparse and ominous
+                if (st == 0) Kick(b, t0, 0.9f, 0.25f);
+                if (st == 8 && bar % 2 == 1) Tom(b, t0, 50f, 0.7f, 0.4f);
+                if (sec == 2 && (st == 4 || st == 12)) Snare(b, t0, 0.25f);
+                if (st % 4 == 0) Hat(b, t0, 0.03f, 0.04f);
+                break;
+        }
+    }
+
+    void Bass(int style, float[] b, float t0, int st, float root, float step)
+    {
+        switch (style)
+        {
+            case 0: // driving eighths with octave jumps
+                if (st % 2 == 0) Note(b, t0, step * 1.9f, (f, t) => Sin(f * t) * 0.7f + Saw(f * t) * 0.35f, root * ((st == 6 || st == 14) ? 2f : 1f), 0.45f, 0.25f);
+                break;
+            case 1: // plucked
+                if (st == 0 || st == 8 || st == 11) Note(b, t0, step * 3f, (f, t) => Sin(f * t) * 0.8f + Sin(2f * f * t) * 0.25f * Mathf.Exp(-t * 10f), root, 0.5f, 0.35f);
+                break;
+            case 2: // soft quarters
+                if (st % 4 == 0) Note(b, t0, step * 3.8f, (f, t) => Sin(f * t), root, 0.45f, 0.5f);
+                break;
+            case 3: // drone
+                if (st == 0) Note(b, t0, step * 16f, (f, t) => Sin(f * t) * 0.8f + Saw(f * t) * 0.15f, root, 0.4f, 6f);
+                break;
+            default: // distorted chug
+                Note(b, t0, step * 0.95f, (f, t) => (float)Math.Tanh(Saw(f * t) * 3f) * 0.6f, root, 0.35f, 0.2f);
+                break;
+        }
     }
 
     // ---------- menu track: 84 BPM, slow and moody ----------

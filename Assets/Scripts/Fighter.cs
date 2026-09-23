@@ -19,6 +19,9 @@ public class Fx : MonoBehaviour
     public static Fx Spawn(Vector3 pos, Color c, float size, float life, Vector3 vel, float delay)
     {
         var tr = Fighter.Part(null, "fx", PrimitiveType.Sphere, pos, Vector3.one * 0.05f, c, Vector3.zero);
+        var rr = tr.GetComponent<Renderer>();
+        rr.sharedMaterial = Fighter.GlowOf(c);
+        rr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         var f = tr.gameObject.AddComponent<Fx>();
         f.size = size; f.life = life; f.vel = vel; f.t = -delay;
         return f;
@@ -37,10 +40,22 @@ public class Fx : MonoBehaviour
         }
     }
 
+    // puffs of dust kicked up from the floor (not glowing)
+    public static void Dust(Vector3 pos, int n, float spread)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            Vector3 v = new Vector3(Random.Range(-1f, 1f) * spread, Random.Range(0.2f, 1.2f), Random.Range(-0.5f, 0.5f));
+            Fx f = Spawn(pos + new Vector3(Random.Range(-0.3f, 0.3f), 0.1f, 0f), Color.white, Random.Range(0.25f, 0.45f), Random.Range(0.35f, 0.6f), v, 0f).Mode(1);
+            f.GetComponent<Renderer>().sharedMaterial = Fighter.MatOf(new Color(0.55f, 0.5f, 0.45f));
+        }
+    }
+
     public static void Seg(Vector3 a, Vector3 b, Color c, float w, float life)
     {
         Vector3 d = b - a;
         var tr = Fighter.Part(null, "bolt", PrimitiveType.Cylinder, (a + b) / 2f, new Vector3(w, d.magnitude / 2f, w), c, Vector3.zero);
+        tr.GetComponent<Renderer>().sharedMaterial = Fighter.GlowOf(c);
         tr.rotation = Quaternion.FromToRotation(Vector3.up, d);
         var f = tr.gameObject.AddComponent<Fx>();
         f.mode = 2; f.size = w; f.life = life;
@@ -116,7 +131,20 @@ public class Move
 {
     public string name, next;
     public float dur, hitAt, dmg, reach, knock = 0.5f, step, stun = 0.28f, gain = 8f, hit2At = -1f;
-    public bool big, low, launch, knockdown, air, weaponMove, unblockable, power;
+    public float critBonus, hop, stepFrom, teleportAt = -1f;
+    public float[] hits;                 // several hit moments for flurries; defaults to hitAt
+    public int ability;                  // 1..3: a cast that fires an ability instead of hitting
+    public bool big, low, launch, knockdown, air, weaponMove, unblockable, power, kick, slam, flashLine, ranged;
+
+    float[] hitCache;
+    public float[] Hits
+    {
+        get
+        {
+            if (hitCache == null) hitCache = hits ?? (hit2At > 0f ? new[] { hitAt, hit2At } : new[] { hitAt });
+            return hitCache;
+        }
+    }
     public float[] times;
     public Pose[] keys;
 
@@ -136,11 +164,13 @@ public class Move
 public class Fighter : MonoBehaviour
 {
     public static float HitStop, Shake;
+    public static bool DebugLog;   // demo runs log dashes and throws
 
     public bool isPlayer, controlsEnabled, autoPlay;
     public Item weapon, helmet, armor;
     public Fighter target;
-    public bool female;
+    public bool female, victory;
+    public int skinId;
     public Color hair = new Color(0.15f, 0.1f, 0.08f);
     public float hp = 100, maxHp = 100, energy, dmgMul = 1f, aiLevel = 1f, yawOffset, headY = 3.6f;
 
@@ -157,6 +187,12 @@ public class Fighter : MonoBehaviour
     Move cur;
     Pose disp;
     float mt, stepped, vy, jumpY, stun, downT, downElapsed, walkT, aiTimer, blockTimer, bufT, guard, blockCd;
+    // evasion: dash with i-frames, invulnerability after getting up, no chain-stun from ranged hits
+    float dashT, dashDir, dashCd, invulnT, rangedImmuneT, aiAbilityCd, aiDashCd, shurikenT, lastTapT;
+    int lastTapDir;
+    public int shuriken = 3;
+    public const int MaxShuriken = 3;
+    bool shown = true;
     Move seenMove;
     float lastPainT = -10f;
     bool hitDone, blocking, moving;
@@ -165,8 +201,16 @@ public class Fighter : MonoBehaviour
     float burnT, burnDps, poisonT, poisonDps, shockT, statusFx, lastDamage, nunA, nunV, lastWAng;
     Transform nunP;
     int facing = 1;
+    float rageT, hasteT, shieldT, shieldFx, crouchT, landT, moveDir, yawCur, idSeed, bounceY, capeA, capeV, flashT;
+    bool critNext, tpDone, wasAir, snapYaw = true, groundHit, flashDirty;
+    int hitIdx, hitVariant;
+    Transform capeP;
+    Renderer[] rends;
+    Color[] baseCols;
+    MaterialPropertyBlock mpb;
+    TrailRenderer wTrail, fTrail;
 
-    struct Intent { public float move; public bool jump, light, heavy, punch, kick, block, ult, down; }
+    struct Intent { public float move; public int ab; public bool jump, light, heavy, punch, kick, block, ult, down, dash, throwStar; }
 
     public int Defense { get { return (helmet != null ? helmet.defense : 0) + (armor != null ? armor.defense : 0); } }
     public bool Dead { get { return hp <= 0; } }
@@ -202,28 +246,83 @@ public class Fighter : MonoBehaviour
     }
 
     // ---------- model ----------
-    static readonly Dictionary<Color, Material> mats = new Dictionary<Color, Material>();
-    static Material baseMat;
+    static readonly Dictionary<string, Material> mats = new Dictionary<string, Material>();
+    static Material baseMat, glowMat, trailMat;
 
-    static Material Mat(Color c)
+    // BaseMat / GlowMat / TrailMat ship as assets so their shaders and keywords survive a player build
+    public static Material MatX(Color c, float metal, float gloss, bool glow)
     {
+        string key = c.ToString("F3") + "|" + metal + "|" + gloss + "|" + glow;
         Material m;
-        if (!mats.TryGetValue(c, out m))
+        if (mats.TryGetValue(key, out m)) return m;
+        if (glow)
         {
-            // BaseMat ships as an asset so its shader is guaranteed to survive a player build.
-            if (baseMat == null) baseMat = Resources.Load<Material>("BaseMat");
-            if (baseMat != null) m = new Material(baseMat);
-            else
-            {
-                Shader sh = Shader.Find("Standard");
-                if (sh == null) sh = Shader.Find("Universal Render Pipeline/Lit");
-                if (sh == null) sh = Shader.Find("Sprites/Default");
-                m = new Material(sh);
-            }
+            if (glowMat == null) glowMat = Resources.Load<Material>("GlowMat");
+            m = glowMat != null ? new Material(glowMat) : NewStandard();
             m.color = c;
-            mats[c] = m;
+            m.EnableKeyword("_EMISSION");
+            m.SetColor("_EmissionColor", c * 1.6f);
         }
+        else
+        {
+            if (baseMat == null) baseMat = Resources.Load<Material>("BaseMat");
+            m = baseMat != null ? new Material(baseMat) : NewStandard();
+            m.color = c;
+            m.SetFloat("_Metallic", metal);
+            m.SetFloat("_Glossiness", gloss);
+        }
+        mats[key] = m;
         return m;
+    }
+
+    static Material NewStandard()
+    {
+        Shader sh = Shader.Find("Standard");
+        if (sh == null) sh = Shader.Find("Universal Render Pipeline/Lit");
+        if (sh == null) sh = Shader.Find("Sprites/Default");
+        return new Material(sh);
+    }
+
+    public static Material MatOf(Color c) { return MatX(c, 0f, 0.25f, false); }
+    public static Material GlowOf(Color c) { return MatX(c, 0f, 0.5f, true); }
+    static Material Mat(Color c) { return MatOf(c); }
+
+    static readonly HashSet<string> ArmorParts = new HashSet<string>
+    {
+        "cuirass", "chestplate", "pauldron", "pauldron2", "greave", "cuisse", "gauntlet", "kneecap", "bracer",
+        "helm", "brow", "crest", "hornL", "hornR", "mask", "buckle", "skirt",
+    };
+
+    // swap matte materials for metal ones on the parts that should shine
+    static void Shine(Transform root, float metal, float gloss, Func<string, bool> pick)
+    {
+        foreach (var r in root.GetComponentsInChildren<Renderer>())
+        {
+            if (r is TrailRenderer || !pick(r.name) || r.sharedMaterial.IsKeywordEnabled("_EMISSION")) continue;
+            r.sharedMaterial = MatX(r.sharedMaterial.color, metal, gloss, false);
+        }
+    }
+
+    public static TrailRenderer MakeTrail(Transform parent, Vector3 local, Color c, float width, float time)
+    {
+        var g = new GameObject("trail");
+        g.transform.SetParent(parent, false);
+        g.transform.localPosition = local;
+        var tr = g.AddComponent<TrailRenderer>();
+        if (trailMat == null) trailMat = Resources.Load<Material>("TrailMat");
+        if (trailMat == null) trailMat = new Material(Shader.Find("Sprites/Default"));
+        tr.sharedMaterial = trailMat;
+        tr.time = time;
+        tr.minVertexDistance = 0.04f;
+        tr.widthCurve = new AnimationCurve(new Keyframe(0f, width), new Keyframe(1f, 0f));
+        var gr = new Gradient();
+        gr.SetKeys(new[] { new GradientColorKey(Color.Lerp(c, Color.white, 0.55f), 0f), new GradientColorKey(c, 1f) },
+                   new[] { new GradientAlphaKey(0.9f, 0f), new GradientAlphaKey(0f, 1f) });
+        tr.colorGradient = gr;
+        tr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        tr.receiveShadows = false;
+        tr.emitting = false;
+        return tr;
     }
 
     public static Transform Part(Transform parent, string n, PrimitiveType type, Vector3 pos, Vector3 scale, Color c, Vector3 euler)
@@ -275,11 +374,12 @@ public class Fighter : MonoBehaviour
             ch.SetParent(null);
             Destroy(ch.gameObject);
         }
-        disp = null; cur = null; pony1 = pony2 = pony3 = null; nunP = null;
+        disp = null; cur = null; pony1 = pony2 = pony3 = null; nunP = null; capeP = null; snapYaw = true; idSeed = Random.value * 10f;
 
-        Color skin = new Color(0.92f, 0.74f, 0.57f), cloth = new Color(0.2f, 0.2f, 0.26f),
+        Skin sk = Db.Skins[Mathf.Clamp(skinId, 0, Db.Skins.Length - 1)];
+        Color skin = sk.skinCol, cloth = sk.cloth,
               wood = new Color(0.36f, 0.24f, 0.14f), gold = new Color(0.92f, 0.78f, 0.34f),
-              leather = new Color(0.26f, 0.17f, 0.12f);
+              leather = sk.extra == 0 ? new Color(0.26f, 0.17f, 0.12f) : Color.Lerp(sk.cloth, Color.black, 0.4f);
         Vector3 z = Vector3.zero;
         PrimitiveType cube = PrimitiveType.Cube, sph = PrimitiveType.Sphere;
         Color pink = new Color(1f, 0.5f, 0.74f), pinkDark = new Color(0.86f, 0.3f, 0.58f);
@@ -339,15 +439,24 @@ public class Fighter : MonoBehaviour
             if (st >= 3) Part(spine, "chestplate", cube, new Vector3(0.05f, 0.46f, 0), new Vector3(depth + 0.06f, 0.34f, width + 0.05f), acc, z);
         }
         chest = Pivot(spine, "chest", new Vector3(0, 0.7f, 0));
-        if (st >= 3)
-            Part(chest, "cape", cube, new Vector3(-depth / 2f - 0.08f, -0.7f, 0), new Vector3(0.09f, 1.5f, width + 0.2f), Db.FactionColor(armor.faction), new Vector3(0, 0, -5));
+        if (st >= 3 || sk.extra == 3)
+        {
+            // the cape hangs from a pivot at the shoulders so it can flutter
+            capeP = Pivot(chest, "capeP", new Vector3(-depth / 2f - 0.07f, 0f, 0));
+            Part(capeP, "cape", cube, new Vector3(-0.02f, -0.72f, 0), new Vector3(0.08f, 1.5f, width + 0.2f), st >= 3 ? Db.FactionColor(armor.faction) : sk.cape, z);
+        }
 
         // head
         Part(chest, "neck", PrimitiveType.Capsule, new Vector3(0, 0.1f, 0), new Vector3(0.2f, 0.13f, 0.2f), skin, z);
         headP = Pivot(chest, "head", new Vector3(0, 0.18f, 0));
         Part(headP, "skull", sph, new Vector3(0, 0.22f, 0), new Vector3(0.48f, 0.54f, 0.46f), skin, z);
-        Part(headP, "eyeL", cube, new Vector3(0.21f, 0.25f, -0.1f), new Vector3(0.05f, 0.06f, 0.08f), Color.black, z);
-        Part(headP, "eyeR", cube, new Vector3(0.21f, 0.25f, 0.1f), new Vector3(0.05f, 0.06f, 0.08f), Color.black, z);
+        Transform eyeL = Part(headP, "eyeL", cube, new Vector3(0.21f, 0.25f, -0.1f), new Vector3(0.05f, 0.06f, 0.08f), sk.eye, z);
+        Transform eyeR = Part(headP, "eyeR", cube, new Vector3(0.21f, 0.25f, 0.1f), new Vector3(0.05f, 0.06f, 0.08f), sk.eye, z);
+        if (sk.glowEyes)
+        {
+            eyeL.GetComponent<Renderer>().sharedMaterial = GlowOf(sk.eye);
+            eyeR.GetComponent<Renderer>().sharedMaterial = GlowOf(sk.eye);
+        }
         Part(headP, "hairTop", sph, new Vector3(-0.04f, 0.32f, 0), new Vector3(0.53f, 0.42f, 0.5f), hair, z);
         if (female)
         {
@@ -362,6 +471,39 @@ public class Fighter : MonoBehaviour
             Limb(pony3, 0.32f, 0.1f, hair);
         }
         else Part(headP, "beard", cube, new Vector3(0.17f, 0.03f, 0), new Vector3(0.12f, 0.17f, 0.34f), hair, z);
+
+        // skin details
+        Color acc2 = sk.accent;
+        switch (sk.extra)
+        {
+            case 1: // ninja
+                Part(headP, "headband", PrimitiveType.Cylinder, new Vector3(-0.01f, 0.36f, 0), new Vector3(0.52f, 0.05f, 0.5f), acc2, z);
+                Part(headP, "bandTail", cube, new Vector3(-0.32f, 0.3f, 0.08f), new Vector3(0.3f, 0.06f, 0.05f), acc2, new Vector3(0, 0, -30));
+                Part(headP, "ninjaMask", cube, new Vector3(0.14f, 0.1f, 0), new Vector3(0.24f, 0.2f, 0.47f), cloth, z);
+                break;
+            case 2: // samurai
+                Part(spine, "sash", cube, new Vector3(0, 0.4f, 0), new Vector3(depth + 0.1f, 0.12f, width + 0.04f), acc2, new Vector3(0, 0, 32));
+                Part(spine, "obi", cube, new Vector3(0, 0.05f, 0), new Vector3(depth + 0.08f, 0.2f, width + 0.06f), acc2, z);
+                Part(headP, "topknot", sph, new Vector3(-0.12f, 0.58f, 0), Vector3.one * 0.17f, hair, z);
+                break;
+            case 3: // royal
+                Part(chest, "collar", PrimitiveType.Cylinder, new Vector3(0, 0.02f, 0), new Vector3(depth + 0.16f, 0.05f, width + 0.1f), acc2, z);
+                Part(spine, "royalBelt", cube, new Vector3(0, 0.05f, 0), new Vector3(depth + 0.08f, 0.14f, width + 0.06f), acc2, z);
+                break;
+            case 4: // demon
+                Part(headP, "dhornL", cube, new Vector3(0.02f, 0.55f, -0.16f), new Vector3(0.07f, 0.28f, 0.07f), acc2, new Vector3(-20, 0, -15));
+                Part(headP, "dhornR", cube, new Vector3(0.02f, 0.55f, 0.16f), new Vector3(0.07f, 0.28f, 0.07f), acc2, new Vector3(20, 0, -15));
+                break;
+            case 5: // zombie
+                Part(spine, "rag", cube, new Vector3(depth / 2f, 0.2f, 0.12f), new Vector3(0.06f, 0.35f, 0.2f), acc2, new Vector3(0, 0, 18));
+                Part(spine, "rag", cube, new Vector3(depth / 2f, 0.55f, -0.15f), new Vector3(0.06f, 0.22f, 0.16f), acc2, new Vector3(0, 0, -14));
+                break;
+            case 6: // robot
+                Part(headP, "antenna", PrimitiveType.Cylinder, new Vector3(-0.05f, 0.64f, 0), new Vector3(0.03f, 0.14f, 0.03f), cloth, z);
+                Part(headP, "antennaTip", sph, new Vector3(-0.05f, 0.8f, 0), Vector3.one * 0.09f, acc2, z).GetComponent<Renderer>().sharedMaterial = GlowOf(new Color(1f, 0.2f, 0.2f));
+                Part(spine, "core", sph, new Vector3(depth / 2f + 0.02f, 0.45f, 0), Vector3.one * 0.16f, acc2, z).GetComponent<Renderer>().sharedMaterial = GlowOf(acc2);
+                break;
+        }
 
         if (helmet != null)
         {
@@ -406,6 +548,29 @@ public class Fighter : MonoBehaviour
         // weapon: origin at the leading hand, blade along +X
         weaponP = Pivot(chest, "weapon", z);
         BuildWeapon(wood, gold);
+
+        // materials: metal where it should shine
+        if (sk.metal) Shine(body, 0.65f, 0.7f, n => true);
+        Shine(body, 0.55f, 0.62f, n => ArmorParts.Contains(n));
+        Shine(weaponP, 0.85f, 0.8f, n => n != "rod");
+        if (sk.extra == 7)
+        {
+            var aura = new GameObject("aura").AddComponent<Light>();
+            aura.transform.SetParent(chest, false);
+            aura.type = LightType.Point; aura.color = new Color(1f, 0.85f, 0.4f); aura.range = 4f; aura.intensity = 1.4f;
+        }
+
+        // renderers for the hit flash (before the trails, which are renderers too)
+        var list = new List<Renderer>();
+        foreach (var r in GetComponentsInChildren<Renderer>()) if (!(r is TrailRenderer)) list.Add(r);
+        rends = list.ToArray();
+        baseCols = new Color[rends.Length];
+        for (int i = 0; i < rends.Length; i++) baseCols[i] = rends[i].sharedMaterial.color;
+        flashT = 0f; flashDirty = false;
+
+        Color tc = Db.FactionColor(weapon.faction);
+        wTrail = MakeTrail(weaponP, new Vector3(weaponLen, 0f, 0f), tc, 0.5f * scale, 0.16f);
+        fTrail = MakeTrail(shinFp, new Vector3(0.1f, -L2, 0f), Color.Lerp(tc, Color.white, 0.6f), 0.3f * scale, 0.14f);
 
         BuildMoves();
     }
@@ -565,25 +730,6 @@ public class Fighter : MonoBehaviour
             },
         };
 
-        if (weapon.wtype == 11)
-        {
-            // nunchaku: a quick two-hit flurry instead of one big swing
-            moves["slash"] = new Move
-            {
-                name = "slash", weaponMove = true, dur = 0.62f / ws, hitAt = 0.34f, hit2At = 0.72f, dmg = wd * 0.75f, reach = wr, step = 0.7f, stun = 0.22f, knock = 0.3f, gain = 9,
-                times = new[] { 0f, 0.18f, 0.34f, 0.52f, 0.72f, 1f },
-                keys = new[]
-                {
-                    G(),
-                    K(p => { p.lean = -4; p.wx = 0.1f; p.wy = 0.45f; p.wAng = 150; p.thighF = 26; p.shinF = -30; }),
-                    K(p => { p.lean = 20; p.hipX = 0.3f; p.wx = 0.95f; p.wy = -0.1f; p.wAng = -40; p.thighF = 44; p.shinF = -38; p.thighB = -32; }),
-                    K(p => { p.lean = 8; p.hipX = 0.2f; p.wx = 0.5f; p.wy = 0.35f; p.wAng = 120; p.thighF = 38; p.shinF = -34; p.thighB = -28; }),
-                    K(p => { p.lean = 26; p.hipX = 0.45f; p.wx = 1.0f; p.wy = -0.25f; p.wAng = -70; p.thighF = 48; p.shinF = -40; p.thighB = -34; }),
-                    G(),
-                },
-            };
-        }
-
         moves["jab"] = new Move
         {
             name = "jab", next = "cross", dur = 0.3f, hitAt = 0.42f, dmg = 7f, reach = 2.15f, step = 0.25f, stun = 0.22f, knock = 0.35f,
@@ -672,11 +818,191 @@ public class Fighter : MonoBehaviour
             times = new[] { 0f, 0.2f, 1f },
             keys = new[] { K(p => { p.thighF = 60; p.shinF = -70; p.thighB = -10; p.shinB = -60; }), air, air },
         };
+
+        BuildFactionMoves(ws, wr, wd);
+        BuildAbilityMoves();
+        foreach (string k in new[] { "kick1", "round", "sweep", "jumpkick" }) moves[k].kick = true;
+    }
+
+    // every faction swings its weapon its own way
+    void BuildFactionMoves(float ws, float wr, float wd)
+    {
+        switch (weapon.faction)
+        {
+            case Faction.Legion:
+                // heavy overhead cleave that chains into a rising cut; the heavy is a leaping ground slam
+                moves["slash"] = new Move
+                {
+                    name = "slash", next = "slash2", weaponMove = true, dur = 0.7f / ws, hitAt = 0.52f, dmg = wd * 1.4f, reach = wr, step = 0.5f, stun = 0.4f, knock = 0.9f, gain = 11,
+                    times = new[] { 0f, 0.38f, 0.52f, 0.75f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = -12; p.hipX = -0.15f; p.wx = -0.05f; p.wy = 0.85f; p.wAng = 170; p.thighF = 20; p.shinF = -24; p.thighB = -26; p.shinB = -10; }),
+                        K(p => { p.lean = 32; p.hipX = 0.45f; p.hipY = -0.1f; p.wx = 1.0f; p.wy = -0.4f; p.wAng = -80; p.thighF = 55; p.shinF = -48; p.thighB = -36; p.shinB = -26; }),
+                        K(p => { p.lean = 30; p.hipX = 0.45f; p.hipY = -0.1f; p.wx = 1.0f; p.wy = -0.45f; p.wAng = -84; p.thighF = 55; p.shinF = -48; p.thighB = -36; p.shinB = -26; }),
+                        G(),
+                    },
+                };
+                moves["slash2"] = new Move
+                {
+                    name = "slash2", weaponMove = true, dur = 0.6f / ws, hitAt = 0.45f, dmg = wd * 1.2f, reach = wr, step = 0.4f, stun = 0.5f, knock = 0.8f, big = true, launch = true, knockdown = true, gain = 12,
+                    times = new[] { 0f, 0.25f, 0.45f, 0.7f, 1f },
+                    keys = new[]
+                    {
+                        K(p => { p.lean = 30; p.hipX = 0.45f; p.wx = 1.0f; p.wy = -0.45f; p.wAng = -84; p.thighF = 55; p.shinF = -48; p.thighB = -36; }),
+                        K(p => { p.lean = 24; p.hipY = -0.2f; p.wx = 0.7f; p.wy = -0.55f; p.wAng = -60; p.thighF = 50; p.shinF = -60; p.thighB = -30; p.shinB = -30; }),
+                        K(p => { p.lean = -14; p.hipX = 0.3f; p.wx = 0.45f; p.wy = 0.85f; p.wAng = 110; p.thighF = 24; p.shinF = -20; }),
+                        K(p => { p.lean = -12; p.hipX = 0.3f; p.wx = 0.4f; p.wy = 0.85f; p.wAng = 115; p.thighF = 24; p.shinF = -20; }),
+                        G(),
+                    },
+                };
+                moves["smash"] = new Move
+                {
+                    name = "smash", weaponMove = true, slam = true, dur = 1.1f / ws, hitAt = 0.58f, dmg = wd * 2.0f, reach = wr + 2.6f, step = 0.3f, stun = 0.6f, knock = 1.3f, big = true, knockdown = true, hop = 5.5f, gain = 15,
+                    times = new[] { 0f, 0.4f, 0.58f, 0.82f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = -16; p.hipY = 0.05f; p.wx = -0.1f; p.wy = 0.9f; p.wAng = 175; p.thighF = 60; p.shinF = -90; p.thighB = 30; p.shinB = -90; }),
+                        K(p => { p.lean = 40; p.hipY = -0.25f; p.wx = 1.0f; p.wy = -0.6f; p.wAng = -95; p.thighF = 70; p.shinF = -80; p.thighB = -40; p.shinB = -40; }),
+                        K(p => { p.lean = 38; p.hipY = -0.25f; p.wx = 1.0f; p.wy = -0.62f; p.wAng = -95; p.thighF = 70; p.shinF = -80; p.thighB = -40; p.shinB = -40; }),
+                        G(),
+                    },
+                };
+                break;
+
+            case Faction.Dynasty:
+                // a fast three-hit flurry; the heavy is a flying kick that crosses half the arena
+                moves["slash"] = new Move
+                {
+                    name = "slash", weaponMove = true, dur = 0.7f / ws, hitAt = 0.22f, hits = new[] { 0.22f, 0.48f, 0.76f }, dmg = wd * 0.6f, reach = wr, step = 0.9f, stun = 0.2f, knock = 0.25f, gain = 7,
+                    times = new[] { 0f, 0.12f, 0.22f, 0.36f, 0.48f, 0.62f, 0.76f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = -4; p.wx = 0.1f; p.wy = 0.45f; p.wAng = 150; p.thighF = 26; p.shinF = -30; }),
+                        K(p => { p.lean = 20; p.hipX = 0.3f; p.wx = 0.95f; p.wy = -0.1f; p.wAng = -40; p.thighF = 44; p.shinF = -38; p.thighB = -32; }),
+                        K(p => { p.lean = 6; p.hipX = 0.25f; p.wx = 0.4f; p.wy = 0.4f; p.wAng = 130; p.thighF = 38; p.shinF = -34; p.thighB = -28; }),
+                        K(p => { p.lean = 26; p.hipX = 0.4f; p.wx = 1.0f; p.wy = -0.3f; p.wAng = -70; p.thighF = 48; p.shinF = -40; p.thighB = -34; }),
+                        K(p => { p.lean = 0; p.hipX = 0.35f; p.wx = 0.2f; p.wy = 0.2f; p.wAng = 200; p.thighF = 40; p.shinF = -36; p.thighB = -30; }),
+                        K(p => { p.lean = 22; p.hipX = 0.5f; p.wx = 1.05f; p.wy = 0.05f; p.wAng = 0; p.thighF = 50; p.shinF = -44; p.thighB = -36; }),
+                        G(),
+                    },
+                };
+                moves["smash"] = new Move
+                {
+                    name = "smash", weaponMove = true, kick = true, dur = 0.85f / ws, hitAt = 0.5f, stepFrom = 0.15f, dmg = wd * 1.7f, reach = wr, step = 3.0f, stun = 0.5f, knock = 1.2f, big = true, knockdown = true, hop = 7f, gain = 13,
+                    times = new[] { 0f, 0.15f, 0.5f, 0.8f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = 20; p.hipY = -0.3f; p.thighF = 60; p.shinF = -90; p.thighB = -20; p.shinB = -60; }),
+                        K(p => { p.lean = -18; p.thighF = 95; p.shinF = -4; p.thighB = 10; p.shinB = -95; p.lTwo = 0; p.wx = 0.2f; p.wy = 0.4f; p.wAng = 120; p.lUp = 40; p.lFo = 40; }),
+                        K(p => { p.lean = -14; p.thighF = 90; p.shinF = -6; p.thighB = 10; p.shinB = -95; p.lTwo = 0; p.wx = 0.2f; p.wy = 0.4f; p.wAng = 120; p.lUp = 40; p.lFo = 40; }),
+                        G(),
+                    },
+                };
+                break;
+
+            case Faction.Heralds:
+                // precision: a long lunging thrust, and a drawn-sword dash that cuts clean through
+                moves["slash"] = new Move
+                {
+                    name = "slash", weaponMove = true, dur = 0.48f / ws, hitAt = 0.45f, dmg = wd * 1.15f, reach = wr + 0.9f, step = 1.1f, stun = 0.3f, knock = 0.6f, critBonus = 0.2f, gain = 10,
+                    times = new[] { 0f, 0.3f, 0.45f, 0.7f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = -6; p.hipX = -0.2f; p.wx = 0.1f; p.wy = 0.1f; p.wAng = 5; p.thighF = 20; p.shinF = -30; p.thighB = -20; }),
+                        K(p => { p.lean = 22; p.hipX = 0.6f; p.wx = 1.05f; p.wy = 0.05f; p.wAng = 0; p.thighF = 70; p.shinF = -60; p.thighB = -50; p.shinB = -10; }),
+                        K(p => { p.lean = 20; p.hipX = 0.6f; p.wx = 1.05f; p.wy = 0.05f; p.wAng = 0; p.thighF = 70; p.shinF = -60; p.thighB = -50; p.shinB = -10; }),
+                        G(),
+                    },
+                };
+                moves["smash"] = new Move
+                {
+                    name = "smash", weaponMove = true, flashLine = true, dur = 1.05f / ws, hitAt = 0.62f, stepFrom = 0.5f, dmg = wd * 2.3f, reach = wr + 0.4f, step = 3.2f, stun = 0.55f, knock = 1.3f, big = true, knockdown = true, critBonus = 0.4f, gain = 14,
+                    times = new[] { 0f, 0.45f, 0.55f, 0.62f, 0.85f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = 28; p.hipY = -0.3f; p.wx = -0.2f; p.wy = -0.25f; p.wAng = -150; p.thighF = 60; p.shinF = -80; p.thighB = -40; p.shinB = -40; }),
+                        K(p => { p.lean = 30; p.hipY = -0.32f; p.wx = -0.22f; p.wy = -0.25f; p.wAng = -152; p.thighF = 62; p.shinF = -82; p.thighB = -40; p.shinB = -40; }),
+                        K(p => { p.lean = 18; p.hipX = 0.6f; p.hipY = -0.15f; p.wx = 1.0f; p.wy = 0.3f; p.wAng = 30; p.thighF = 65; p.shinF = -55; p.thighB = -50; p.shinB = -20; }),
+                        K(p => { p.lean = 10; p.hipX = 0.5f; p.wx = 0.8f; p.wy = 0.55f; p.wAng = 60; p.thighF = 50; p.shinF = -40; p.thighB = -40; }),
+                        G(),
+                    },
+                };
+                break;
+
+            default:
+                // shadow: two quick stabs, and a vanish that reappears behind the enemy
+                moves["slash"] = new Move
+                {
+                    name = "slash", weaponMove = true, dur = 0.5f / ws, hitAt = 0.3f, hits = new[] { 0.3f, 0.62f }, dmg = wd * 0.75f, reach = wr, step = 0.6f, stun = 0.22f, knock = 0.3f, critBonus = 0.1f, gain = 8,
+                    times = new[] { 0f, 0.2f, 0.3f, 0.46f, 0.62f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = -4; p.hipX = -0.1f; p.wx = 0.2f; p.wy = 0.15f; p.wAng = 20; }),
+                        K(p => { p.lean = 20; p.hipX = 0.4f; p.wx = 1.0f; p.wy = 0f; p.wAng = -5; p.thighF = 44; p.shinF = -38; p.thighB = -32; }),
+                        K(p => { p.lean = 6; p.hipX = 0.3f; p.wx = 0.3f; p.wy = 0.3f; p.wAng = 30; p.thighF = 38; p.shinF = -34; }),
+                        K(p => { p.lean = 24; p.hipX = 0.45f; p.wx = 1.05f; p.wy = -0.15f; p.wAng = -15; p.thighF = 48; p.shinF = -40; p.thighB = -34; }),
+                        G(),
+                    },
+                };
+                moves["smash"] = new Move
+                {
+                    name = "smash", weaponMove = true, teleportAt = 0.3f, dur = 0.9f / ws, hitAt = 0.62f, dmg = wd * 1.9f, reach = wr + 0.5f, step = 0f, stun = 0.55f, knock = 1.0f, big = true, knockdown = true, critBonus = 0.25f, gain = 13,
+                    times = new[] { 0f, 0.28f, 0.4f, 0.62f, 0.85f, 1f },
+                    keys = new[]
+                    {
+                        G(),
+                        K(p => { p.lean = 30; p.hipY = -0.35f; p.thighF = 60; p.shinF = -90; p.thighB = -30; p.shinB = -60; p.wx = 0.1f; p.wy = -0.1f; p.wAng = -120; }),
+                        K(p => { p.lean = 10; p.hipY = -0.2f; p.wx = 0f; p.wy = 0.6f; p.wAng = 160; p.thighF = 40; p.shinF = -60; }),
+                        K(p => { p.lean = 34; p.hipX = 0.4f; p.wx = 1.0f; p.wy = -0.4f; p.wAng = -85; p.thighF = 55; p.shinF = -48; p.thighB = -36; p.shinB = -26; }),
+                        K(p => { p.lean = 32; p.hipX = 0.4f; p.wx = 1.0f; p.wy = -0.42f; p.wAng = -88; p.thighF = 55; p.shinF = -48; p.thighB = -36; p.shinB = -26; }),
+                        G(),
+                    },
+                };
+                break;
+        }
+    }
+
+    // short casts that fire the abilities; they can be chained one after another
+    void BuildAbilityMoves()
+    {
+        Pose palm = OneHand(p => { p.lean = 10; p.hipX = 0.15f; p.lUp = 90; p.lFo = -5; p.thighF = 36; p.shinF = -36; p.thighB = -26; });
+        Pose raise = K(p => { p.lean = -8; p.head = 6; p.wx = 0.2f; p.wy = 0.9f; p.wAng = 95; p.thighF = 24; p.shinF = -20; p.thighB = -20; });
+        moves["throw"] = new Move
+        {
+            name = "throw", ability = 4, dur = 0.32f, hitAt = 0.4f, step = 0f, gain = 0,
+            times = new[] { 0f, 0.4f, 1f },
+            keys = new[]
+            {
+                OneHand(p => { p.lean = -6; p.lUp = 160; p.lFo = 60; }),
+                OneHand(p => { p.lean = 14; p.hipX = 0.15f; p.lUp = 80; p.lFo = -5; p.thighF = 34; p.shinF = -34; p.thighB = -24; }),
+                G(),
+            },
+        };
+        for (int a = 1; a <= 3; a++)
+            moves["cast" + a] = new Move
+            {
+                name = "cast" + a, ability = a, dur = 0.4f, hitAt = 0.42f, step = a == 1 ? 0.1f : 0f, gain = 0,
+                times = new[] { 0f, 0.42f, 1f },
+                keys = new[] { G(), a == 1 ? palm : raise, G() },
+            };
     }
 
     static Pose BlockPose = K(p => { p.lean = 12; p.hipY = -0.05f; p.wx = 0.65f; p.wy = 0.0f; p.wAng = 88; p.thighF = 26; p.shinF = -32; p.thighB = -20; p.shinB = -14; });
     static Pose HitPose = K(p => { p.lean = -20; p.head = -12; p.hipX = -0.2f; p.lTwo = 0.2f; p.wx = 0.2f; p.wy = 0.1f; p.wAng = 40; p.lUp = -25; p.lFo = 60; p.thighF = 8; p.shinF = -16; p.thighB = -24; p.shinB = -8; });
     static Pose AirPose = K(p => { p.lean = 6; p.lTwo = 0.6f; p.wAng = 50; p.thighF = 48; p.shinF = -75; p.thighB = -22; p.shinB = -60; p.lUp = 70; p.lFo = 60; });
+    static Pose HitPose2 = K(p => { p.lean = -34; p.head = -20; p.hipX = -0.35f; p.hipY = -0.1f; p.lTwo = 0; p.wx = 0.1f; p.wy = 0.3f; p.wAng = 120; p.lUp = 120; p.lFo = 40; p.thighF = 30; p.shinF = -50; p.thighB = -30; p.shinB = -10; });
+    static Pose CrouchPose = K(p => { p.lean = 16; p.hipY = -0.28f; p.wy = -0.1f; p.thighF = 55; p.shinF = -85; p.thighB = -10; p.shinB = -70; });
+    static Pose FallPose = K(p => { p.lean = 2; p.lTwo = 0.7f; p.wAng = 55; p.thighF = 30; p.shinF = -30; p.thighB = -10; p.shinB = -25; p.lUp = 80; p.lFo = 50; });
+    static Pose KneelPose = K(p => { p.lean = 22; p.head = 6; p.lTwo = 0.3f; p.wx = 0.5f; p.wy = -0.35f; p.wAng = -30; p.thighF = 75; p.shinF = -95; p.thighB = -5; p.shinB = -115; });
+    static Pose VictoryPose = K(p => { p.lean = -8; p.head = 8; p.lTwo = 0; p.wx = 0.3f; p.wy = 0.95f; p.wAng = 95; p.lUp = 150; p.lFo = 10; p.thighF = 18; p.shinF = -10; p.thighB = -18; p.shinB = -6; });
     static Pose DownPose = K(p => { p.lean = 0; p.lTwo = 0; p.wx = 0.4f; p.wy = 0f; p.wAng = 20; p.lUp = -10; p.lFo = 15; p.thighF = 8; p.shinF = -8; p.thighB = -8; p.shinB = -8; });
 
     // ---------- input ----------
@@ -693,6 +1019,18 @@ public class Fighter : MonoBehaviour
         it.kick = Input.GetKeyDown(KeyCode.H);
         it.block = Input.GetKey(KeyCode.L);
         it.ult = Input.GetKeyDown(KeyCode.I);
+        if (Input.GetKeyDown(KeyCode.Alpha1) || Input.GetKeyDown(KeyCode.Keypad1)) it.ab = 1;
+        else if (Input.GetKeyDown(KeyCode.Alpha2) || Input.GetKeyDown(KeyCode.Keypad2)) it.ab = 2;
+        else if (Input.GetKeyDown(KeyCode.Alpha3) || Input.GetKeyDown(KeyCode.Keypad3)) it.ab = 3;
+        it.throwStar = Input.GetKeyDown(KeyCode.O);
+        // dash: Shift, or a quick double tap of A / D
+        it.dash = Input.GetKeyDown(KeyCode.LeftShift) || Input.GetKeyDown(KeyCode.RightShift);
+        int tap = Input.GetKeyDown(KeyCode.A) || Input.GetKeyDown(KeyCode.LeftArrow) ? -1 : Input.GetKeyDown(KeyCode.D) || Input.GetKeyDown(KeyCode.RightArrow) ? 1 : 0;
+        if (tap != 0)
+        {
+            if (tap == lastTapDir && Time.time - lastTapT < 0.25f) { it.dash = true; lastTapDir = 0; }
+            else { lastTapDir = tap; lastTapT = Time.time; }
+        }
         return it;
     }
 
@@ -704,6 +1042,13 @@ public class Fighter : MonoBehaviour
         float wr = WeaponReach;
         aiTimer -= Time.deltaTime;
 
+        aiAbilityCd -= Time.deltaTime;
+        aiDashCd -= Time.deltaTime;
+        // sometimes dash out of the way of a big attack
+        if (aiDashCd <= 0f && target.cur != null && (target.cur.power || target.cur.big) && dist < target.cur.reach + 0.5f && Random.value < 0.015f * aiLevel)
+        {
+            it.dash = true; it.move = -Mathf.Sign(dx); aiDashCd = 2f;
+        }
         if (dist > wr * 0.8f) it.move = Mathf.Sign(dx) * Mathf.Min(1f, 0.55f + 0.08f * aiLevel);
         else if (dist < 1.8f) it.move = -Mathf.Sign(dx) * 0.6f;
 
@@ -715,6 +1060,17 @@ public class Fighter : MonoBehaviour
             if (blockCd <= 0f && dist < target.cur.reach + 0.4f && Random.value < 0.2f + 0.04f * aiLevel) { blockTimer = 0.5f; blockCd = 1.6f; }
         }
         if (blockTimer > 0) { blockTimer -= Time.deltaTime; it.block = true; }
+        else if (cur == null && aiTimer <= 0f && aiAbilityCd <= 0f && Charges >= 1 && Random.value < 0.3f)
+        {
+            it.ab = AiPickAbility(dist);
+            aiTimer = it.ab > 0 ? 0.35f : 0.2f;
+            if (it.ab > 0) aiAbilityCd = Random.Range(2.5f, 4.5f) / (0.7f + 0.05f * aiLevel);   // no endless spam
+        }
+        else if (cur == null && aiTimer <= 0f && dist > 4f && shuriken > 0 && Random.value < 0.25f)
+        {
+            it.throwStar = true;
+            aiTimer = Random.Range(0.4f, 0.9f);
+        }
         else if (cur == null && aiTimer <= 0f)
         {
             float r = Random.value;
@@ -736,7 +1092,7 @@ public class Fighter : MonoBehaviour
         {
             if (cur.name == "jab" || cur.name == "cross") it.punch = true; else it.kick = true;
         }
-        if (energy >= 100f && dist < PowerRange) it.ult = true;
+        if (Charges >= 3 && dist < PowerRange && Random.value < 0.03f) it.ult = true;
         return it;
     }
 
@@ -746,7 +1102,9 @@ public class Fighter : MonoBehaviour
     void StartMove(string name)
     {
         cur = moves[name];
-        mt = 0f; stepped = 0f; hitDone = false; hit2Done = false; buf = null;
+        mt = 0f; stepped = 0f; hitDone = false; hit2Done = false; buf = null; hitIdx = 0; tpDone = false;
+        if (cur.hop > 0f && Grounded) vy = cur.hop;
+        if (name == "power") Zoom = 1f;
         if (name == "power")
         {
             energy = 0f;
@@ -760,6 +1118,230 @@ public class Fighter : MonoBehaviour
             Fx.Flash(c, Db.FactionColor(weapon.faction), 10f, 0.9f);
         }
         GameAudio.Sfx(name == "smash" || name == "power" || name == "round" || name == "upper" ? "whoosh2" : "whoosh");
+    }
+
+    // ---------- abilities: the energy bar holds three charges ----------
+    public const float Seg = 100f / 3f;
+    public const float ArenaHalf = 10f;
+    public static float Zoom;
+    public int Charges { get { return Mathf.FloorToInt(energy / Seg + 0.001f); } }
+    public bool Hittable { get { return !Dead && downT <= 0f && invulnT <= 0f; } }
+    public bool Dashing { get { return dashT > 0f; } }
+
+    static readonly string[,] AbilityNames =
+    {
+        { "Огненный шар", "Ярость", "Метеоры" },
+        { "Шаровая молния", "Ускорение", "Гроза" },
+        { "Световая стрела", "Исцеление", "Святой щит" },
+        { "Теневой сгусток", "Шаг в тень", "Ядовитое облако" },
+    };
+
+    static readonly Move ProjMove = new Move { name = "proj", ranged = true, stun = 0.3f, knock = 0.5f, gain = 0f };
+    public static readonly Move StarMove = new Move { name = "shuriken", ranged = true, stun = 0.12f, knock = 0.15f, gain = 0f };
+    static readonly Move MeteorMove = new Move { name = "meteor", ranged = true, stun = 0.45f, knock = 0.8f, big = true, gain = 0f };
+    static readonly Move MeteorBig = new Move { name = "meteor", ranged = true, stun = 0.5f, knock = 1.1f, big = true, knockdown = true, gain = 0f };
+    static readonly Move BoltMove = new Move { name = "bolt", ranged = true, stun = 0.25f, knock = 0.2f, unblockable = true, gain = 0f };
+    static readonly Move BoltLast = new Move { name = "bolt", ranged = true, stun = 0.4f, knock = 0.6f, big = true, unblockable = true, gain = 0f };
+
+    public string AbilityName(int a) { return AbilityNames[(int)weapon.faction, a - 1]; }
+    public int AbilityCost(int a) { return a == 3 ? 2 : 1; }
+    public static bool IsAbilityKey(string k) { return k == "1" || k == "2" || k == "3"; }
+
+    bool CanCast(int a)
+    {
+        if (!Grounded || Charges < AbilityCost(a)) return false;
+        if (a == 2 && weapon.faction == Faction.Legion && rageT > 0f) return false;
+        if (a == 2 && weapon.faction == Faction.Dynasty && hasteT > 0f) return false;
+        return true;
+    }
+
+    void StartCast(int a)
+    {
+        energy = Mathf.Max(0f, energy - AbilityCost(a) * Seg);
+        StartMove("cast" + a);
+        Color c = Db.FactionColor(weapon.faction);
+        Fx.Flash(transform.position + new Vector3(0, 2f * scale, 0), c, 7f, 0.4f);
+        Fx.Sparks(transform.position + new Vector3(facing * 0.6f, 2f * scale, 0), c, 10, 4f);
+    }
+
+    void CastAbility(int a)
+    {
+        if (target == null) return;
+        Fighter tgt = target;
+        if (a == 4)
+        {
+            GameAudio.Sfx("whoosh");
+            if (DebugLog) Debug.Log("EVT shuriken by " + name);
+            Vector3 from = transform.position + new Vector3(facing * 1.1f * scale, 1.8f * scale, -0.2f);
+            Projectile.Shuriken(tgt, from, new Vector3(facing * 19f, 0f, 0f), (4f + weapon.damage * 0.15f) * dmgMul);
+            return;
+        }
+        float wd = weapon.damage, mul = dmgMul * (rageT > 0f ? 1.5f : 1f);
+        Vector3 hand = transform.position + new Vector3(facing * 1.2f * scale, 1.7f * scale, 0f);
+        Vector3 chestP = transform.position + new Vector3(0f, 1.9f * scale, 0f);
+        switch (weapon.faction)
+        {
+            case Faction.Legion:
+                if (a == 1)
+                {
+                    GameAudio.Sfx("fire");
+                    Projectile.Launch(tgt, hand, new Vector3(facing * 11f, 0f, 0f), 0.55f, new Color(1f, 0.45f, 0.1f), (10f + wd * 0.6f) * mul, ProjMove,
+                        t => t.ApplyStatus("burn", 2.5f, Mathf.Max(3f, wd * 0.25f)), false, 1.0f);
+                }
+                else if (a == 2) { rageT = 6f; GameAudio.Sfx("fire"); Fx.Sparks(chestP, new Color(1f, 0.25f, 0.1f), 20, 6f); }
+                else StartCoroutine(Meteors(tgt, (9f + wd * 0.55f) * mul));
+                break;
+            case Faction.Dynasty:
+                if (a == 1)
+                {
+                    GameAudio.Sfx("zap");
+                    Projectile.Launch(tgt, hand, new Vector3(facing * 16f, 0f, 0f), 0.42f, new Color(0.6f, 0.85f, 1f), (8f + wd * 0.5f) * mul, ProjMove,
+                        t => t.ApplyStatus("shock", 0.6f, 0f), false, 0.9f);
+                }
+                else if (a == 2) { hasteT = 6f; GameAudio.Sfx("zap"); Fx.Sparks(chestP, new Color(0.5f, 0.9f, 1f), 20, 6f); }
+                else StartCoroutine(Storm(tgt, (6f + wd * 0.35f) * mul));
+                break;
+            case Faction.Heralds:
+                if (a == 1)
+                {
+                    GameAudio.Sfx("holy");
+                    Projectile.Launch(tgt, hand, new Vector3(facing * 24f, 0f, 0f), 0.35f, new Color(1f, 0.92f, 0.55f), (9f + wd * 0.6f) * mul * 1.6f, ProjMove, null, false, 0.9f);
+                }
+                else if (a == 2)
+                {
+                    hp = Mathf.Min(maxHp, hp + maxHp * 0.15f);
+                    GameAudio.Sfx("holy");
+                    for (int k = 0; k < 16; k++)
+                        Fx.Spawn(transform.position + new Vector3(Random.Range(-0.7f, 0.7f), Random.Range(0.2f, 3f), Random.Range(-0.3f, 0.3f)), new Color(0.5f, 1f, 0.5f), 0.22f, 0.8f, Vector3.up * 2.5f, k * 0.02f).Mode(1);
+                }
+                else { shieldT = 4f; GameAudio.Sfx("holy"); }
+                break;
+            default:
+                if (a == 1)
+                {
+                    GameAudio.Sfx("dark");
+                    Projectile.Launch(tgt, hand, new Vector3(facing * 8f, 0f, 0f), 0.6f, new Color(0.55f, 0.15f, 0.8f), (8f + wd * 0.5f) * mul, ProjMove,
+                        t => t.ApplyStatus("poison", 3f, Mathf.Max(3f, wd * 0.2f)), false, 1.1f);
+                }
+                else if (a == 2) { TeleportBehind(); critNext = true; }
+                else { GameAudio.Sfx("dark"); PoisonCloud.Spawn(tgt, tgt.transform.position.x, Mathf.Max(4f, wd * 0.3f), new Color(0.5f, 0.15f, 0.7f)); }
+                break;
+        }
+    }
+
+    System.Collections.IEnumerator Meteors(Fighter tgt, float dmg)
+    {
+        GameAudio.Sfx("fire");
+        float[] off = { -0.9f, 0.9f, 0f };
+        for (int i = 0; i < 3; i++)
+        {
+            float x = tgt.transform.position.x + off[i];
+            Vector3 start = new Vector3(x - facing * 3f, 13f, 0.3f);
+            Vector3 v = (new Vector3(x, 0.3f, 0f) - start).normalized * 20f;
+            Projectile.Launch(tgt, start, v, 0.75f, new Color(1f, 0.4f, 0.08f), dmg, i == 2 ? MeteorBig : MeteorMove, t => t.ApplyStatus("burn", 1.5f, 3f), true, 1.6f);
+            yield return new WaitForSeconds(0.28f);
+        }
+    }
+
+    System.Collections.IEnumerator Storm(Fighter tgt, float dmg)
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            yield return new WaitForSeconds(0.22f);
+            if (tgt == null) yield break;
+            Vector3 hit = new Vector3(tgt.transform.position.x + Random.Range(-0.4f, 0.4f), 0.2f, 0f);
+            GameAudio.Sfx("zap");
+            Fx.Bolt(hit + new Vector3(Random.Range(-1f, 1f), 16f, 0f), hit, new Color(0.7f, 0.9f, 1f), 0.2f, 0.35f);
+            Fx.Flash(hit + Vector3.up * 2f, new Color(0.6f, 0.85f, 1f), 12f, 0.35f);
+            Fx.Sparks(hit + Vector3.up, new Color(0.8f, 0.95f, 1f), 10, 7f);
+            Shake = Mathf.Max(Shake, 0.12f);
+            if (tgt.Hittable && Mathf.Abs(tgt.transform.position.x - hit.x) < 1.3f)
+            {
+                bool landed = tgt.TakeHit(i == 3 ? BoltLast : BoltMove, dmg, tgt.transform.position.x >= transform.position.x ? 1 : -1);
+                if (landed && i == 3) tgt.ApplyStatus("shock", 0.8f, 0f);
+            }
+        }
+    }
+
+    // vanish in smoke and reappear on the far side of the enemy (in front if there is no room behind)
+    void TeleportBehind()
+    {
+        if (target == null) return;
+        float tx = target.transform.position.x;
+        float nx = tx + facing * 1.7f;
+        if (nx > ArenaHalf - 0.2f || nx < -ArenaHalf + 0.2f) nx = tx - facing * 1.7f;
+        SmokePuff(transform.position);
+        transform.position = new Vector3(Mathf.Clamp(nx, -ArenaHalf, ArenaHalf), transform.position.y, 0f);
+        facing = tx >= nx ? 1 : -1;
+        snapYaw = true;
+        SmokePuff(transform.position);
+        GameAudio.Sfx("whoosh2");
+    }
+
+    void SmokePuff(Vector3 p)
+    {
+        for (int k = 0; k < 10; k++)
+            Fx.Spawn(p + new Vector3(Random.Range(-0.6f, 0.6f), Random.Range(0.3f, 3.2f), Random.Range(-0.3f, 0.3f)), new Color(0.3f, 0.1f, 0.4f), Random.Range(0.5f, 0.9f), 0.5f,
+                new Vector3(Random.Range(-1f, 1f), 1.5f, 0f), 0f).Mode(1);
+    }
+
+    void SlamVfx(Vector3 mp)
+    {
+        GameAudio.Sfx("hit2");
+        Shake = Mathf.Max(Shake, 0.3f);
+        Color c = Color.Lerp(Db.FactionColor(weapon.faction), new Color(1f, 0.8f, 0.4f), 0.5f);
+        for (int i = 0; i < 12; i++)
+        {
+            Vector3 pos = new Vector3(mp.x + facing * (0.9f + i * 0.35f), 0.1f, Random.Range(-0.4f, 0.4f));
+            Fx.Spawn(pos, c, 0.5f + i * 0.03f, 0.45f, Vector3.up * Random.Range(1f, 3f), i * 0.025f).Mode(1);
+            if (i % 2 == 0) Fx.Dust(pos, 2, 1f);
+        }
+        Fx.Flash(mp + new Vector3(facing * 2f, 0.5f, 0f), c, 10f, 0.4f);
+    }
+
+    int AiPickAbility(float dist)
+    {
+        var opts = new List<int>();
+        Faction f = weapon.faction;
+        if (dist > 3.2f) opts.Add(1);
+        switch (f)
+        {
+            case Faction.Legion: if (dist < 6f && rageT <= 0f) opts.Add(2); break;
+            case Faction.Dynasty: if (dist < 6f && hasteT <= 0f) opts.Add(2); break;
+            case Faction.Heralds: if (hp < maxHp * 0.65f) { opts.Add(2); opts.Add(2); } break;
+            default: if (dist > 2.5f) opts.Add(2); break;
+        }
+        if (Charges >= 2 && (f != Faction.Heralds || hp < maxHp * 0.5f || (target != null && target.Attacking))) opts.Add(3);
+        return opts.Count == 0 ? 0 : opts[Random.Range(0, opts.Count)];
+    }
+
+    public void ApplyStatus(string kind, float t, float dps)
+    {
+        if (Dead || shieldT > 0f) return;
+        switch (kind)
+        {
+            case "burn": burnDps = burnT > 0f ? Mathf.Max(burnDps, dps) : dps; burnT = Mathf.Max(burnT, t); break;
+            case "poison": poisonDps = poisonT > 0f ? Mathf.Max(poisonDps, dps) : dps; poisonT = Mathf.Max(poisonT, t); break;
+            case "shock": if (shockT > 0f) break; shockT = t; stun = Mathf.Max(stun, t); break;
+        }
+    }
+
+    // buffs and debuffs, shown above the head
+    public string Buffs
+    {
+        get
+        {
+            string b = "";
+            if (rageT > 0f) b += "<color=#ff5030>ЯРОСТЬ</color> ";
+            if (hasteT > 0f) b += "<color=#60e0ff>УСКОРЕНИЕ</color> ";
+            if (shieldT > 0f) b += "<color=#ffe070>ЩИТ</color> ";
+            if (invulnT > 0f && dashT <= 0f && controlsEnabled) b += "<color=#ffffff>НЕУЯЗВИМ</color> ";
+            if (critNext) b += "<color=#d080ff>КРИТ</color> ";
+            if (burnT > 0f) b += "<color=#ff9030>ГОРИТ</color> ";
+            if (poisonT > 0f) b += "<color=#b060ff>ЯД</color> ";
+            if (shockT > 0f) b += "<color=#a0d8ff>ПАРАЛИЧ</color> ";
+            return b;
+        }
     }
 
     bool Grounded { get { return jumpY <= 0.02f; } }
@@ -779,13 +1361,18 @@ public class Fighter : MonoBehaviour
         Vector3 tp = target.transform.position, mp = transform.position;
         float dx = (tp.x - mp.x) * facing, dy = Mathf.Abs(tp.y - mp.y);
         if (m.power) PowerVfx(mp, tp);
-        bool vertOk = m.power || (dy < 1.9f && (!m.low || target.jumpY < 0.6f));
+        if (m.slam) SlamVfx(mp);
+        if (m.flashLine)
+            Fx.Seg(new Vector3(mp.x - facing * 3.4f, 1.7f * scale, 0f), new Vector3(mp.x + facing * 0.6f, 1.7f * scale, 0f), Color.white, 0.12f, 0.3f);
+        bool vertOk = m.power || (dy < 1.9f && (!m.low || target.jumpY < 0.6f) && (!m.slam || target.jumpY < 0.8f));
         if (dx > -0.4f && dx <= m.reach && vertOk)
         {
             float d = m.dmg * dmgMul;
             // weapon strikes can crit; the Heralds' light is always a precise, critical hit
-            bool crit = (m.weaponMove || (m.power && weapon.faction == Faction.Heralds)) && Random.value < (m.power ? 1f : weapon.crit);
+            bool crit = critNext || ((m.weaponMove || (m.power && weapon.faction == Faction.Heralds)) && Random.value < (m.power ? 1f : weapon.crit + m.critBonus));
+            critNext = false;
             if (crit) d *= 1.6f;
+            if (rageT > 0f) d *= 1.5f;
             bool landed = target.TakeHit(m, d, facing);
             if (landed)
             {
@@ -885,6 +1472,14 @@ public class Fighter : MonoBehaviour
     {
         if (Dead) return false;
         if (downT > 0f) return false;   // no hitting someone who is already on the floor
+        if (invulnT > 0f) return false;  // dashing or just got up
+        if (shieldT > 0f)
+        {
+            Fx.Sparks(transform.position + new Vector3(-dir * 0.6f, 1.9f * scale, 0f), new Color(1f, 0.9f, 0.4f), 12, 6f);
+            GameAudio.Sfx("block");
+            HitStop = Mathf.Max(HitStop, 0.03f);
+            return false;
+        }
         d *= 1f - Defense / (Defense + 100f);
         Vector3 chest = transform.position + new Vector3(0, 1.9f * scale + jumpY, 0);
         bool blocked = blocking && facing == -dir && !m.low && !m.unblockable;
@@ -910,7 +1505,19 @@ public class Fighter : MonoBehaviour
             lastDamage = d; DirectDamage(d);
             return false;
         }
+        if (m.ranged && rangedImmuneT > 0f)
+        {
+            // already staggered by a ranged hit a moment ago: take the damage but keep control
+            if (DebugLog) Debug.Log("EVT ranged hit without stun on " + name);
+            Fx.Sparks(chest, new Color(1f, 0.35f, 0.15f), 6, 5f);
+            GameAudio.Sfx("hit");
+            flashT = 0.08f; flashDirty = true;
+            lastDamage = d; DirectDamage(d);
+            return true;
+        }
+        if (m.ranged) rangedImmuneT = 1.2f;
         cur = null; buf = null;
+        crouchT = 0f; hitVariant = m.big ? 1 : 0; flashT = 0.1f; flashDirty = true;
         stun = m.stun;
         p.x += dir * m.knock;
         transform.position = p;
@@ -935,6 +1542,10 @@ public class Fighter : MonoBehaviour
         facing = x < 0f ? 1 : -1;
         transform.position = new Vector3(x, 0, 0);
         disp = null;
+        rageT = hasteT = shieldT = crouchT = landT = 0f;
+        dashT = dashCd = invulnT = rangedImmuneT = aiAbilityCd = 0f; shuriken = MaxShuriken; shurikenT = 0f; critNext = false; victory = false; snapYaw = true; wasAir = false;
+        StopAllCoroutines();
+        if (wTrail != null) { wTrail.Clear(); fTrail.Clear(); }
     }
 
     void DirectDamage(float d)
@@ -976,6 +1587,31 @@ public class Fighter : MonoBehaviour
             stun = Mathf.Max(stun, 0.1f);
             if (statusFx <= 0f) Fx.Spawn(p + new Vector3(Random.Range(-0.5f, 0.5f), Random.Range(0.4f, 3.4f), 0), new Color(0.7f, 0.9f, 1f), 0.4f, 0.2f, Vector3.zero, 0f);
         }
+        if (rageT > 0f)
+        {
+            rageT -= dt;
+            if (statusFx <= 0f) Fx.Spawn(p + new Vector3(Random.Range(-0.5f, 0.5f), Random.Range(0.5f, 3.6f), Random.Range(-0.3f, 0.3f)), new Color(1f, 0.2f, 0.1f), 0.3f, 0.45f, Vector3.up * 2.5f, 0f).Mode(1);
+        }
+        if (hasteT > 0f)
+        {
+            hasteT -= dt;
+            if (statusFx <= 0f) Fx.Spawn(p + new Vector3(Random.Range(-0.5f, 0.5f), Random.Range(0.5f, 3.6f), 0f), new Color(0.4f, 0.9f, 1f), 0.22f, 0.3f, new Vector3(-facing * 4f, 0f, 0f), 0f).Mode(1);
+        }
+        if (shieldT > 0f)
+        {
+            shieldT -= dt;
+            shieldFx -= dt;
+            if (shieldFx <= 0f)
+            {
+                shieldFx = 0.025f;
+                Vector3 c = p + new Vector3(0f, 1.9f * scale, 0f);
+                for (int k = 0; k < 2; k++)
+                {
+                    float ang = Time.time * 7f + k * Mathf.PI;
+                    Fx.Spawn(c + new Vector3(Mathf.Cos(ang) * 1.3f, Mathf.Sin(ang) * 2.1f, -0.4f), new Color(1f, 0.9f, 0.45f), 0.2f, 0.4f, Vector3.zero, 0f);
+                }
+            }
+        }
         if (statusFx <= 0f) statusFx = 0.12f;
     }
 
@@ -996,7 +1632,10 @@ public class Fighter : MonoBehaviour
         vy -= 25f * dt;
         jumpY += vy * dt;
         if (jumpY < 0) { jumpY = 0; vy = 0; }
-        p.x = Mathf.Clamp(p.x, -7f, 7f);
+        bool air = jumpY > 0.02f;
+        if (wasAir && !air) { landT = 0.13f; Fx.Dust(new Vector3(transform.position.x, 0.05f, 0f), 6, 1.6f); }
+        wasAir = air;
+        p.x = Mathf.Clamp(p.x, -ArenaHalf, ArenaHalf);
         p.y = jumpY;
         transform.position = p;
     }
@@ -1006,7 +1645,11 @@ public class Fighter : MonoBehaviour
         Intent it = (isPlayer && !autoPlay) ? PlayerIntent() : AIIntent();
         guard = Mathf.Max(0f, guard - 0.3f * dt);
         energy = Mathf.Min(100f, energy + 2.5f * dt);   // trickles in on its own
-        if (it.punch) Buffer("U");
+        invulnT -= dt; rangedImmuneT -= dt; dashCd -= dt;
+        if (shuriken < MaxShuriken) { shurikenT += dt; if (shurikenT >= 1.6f) { shurikenT = 0f; shuriken++; } }
+        if (it.ab > 0) Buffer(it.ab.ToString());
+        else if (it.throwStar) Buffer("O");
+        else if (it.punch) Buffer("U");
         else if (it.kick) Buffer(it.down ? "D" : "H");
         else if (it.light) Buffer("J");
         else if (it.heavy) Buffer("K");
@@ -1017,23 +1660,57 @@ public class Fighter : MonoBehaviour
         moving = false;
         blocking = false;
 
-        if (downT > 0f) { downT -= dt; Motion(dt, 0f); return; }
+        if (downT > 0f)
+        {
+            downT -= dt;
+            if (downT <= 0f) { invulnT = 0.8f; if (DebugLog) Debug.Log("EVT getup invuln " + name); }
+            Motion(dt, 0f);
+            return;
+        }
         if (stun > 0f) { stun -= dt; Motion(dt, 0f); return; }
+        if (dashT > 0f)
+        {
+            dashT -= dt;
+            if (Random.value < 0.6f)
+                Fx.Spawn(transform.position + new Vector3(-dashDir * 0.4f, Random.Range(0.5f, 3f), 0f), Db.FactionColor(weapon.faction), 0.25f, 0.25f, new Vector3(-dashDir * 3f, 0f, 0f), 0f).Mode(1);
+            Motion(dt, dashDir * 15f * dt);
+            return;
+        }
+        if (it.dash && cur == null && Grounded && dashCd <= 0f)
+        {
+            // dash with invulnerability; with no direction held it goes away from the enemy
+            dashDir = it.move != 0f ? Mathf.Sign(it.move) : -facing;
+            dashT = 0.22f; dashCd = 0.6f; invulnT = 0.26f;
+            if (DebugLog) Debug.Log("EVT dash by " + name);
+            blocking = false; crouchT = 0f;
+            Fx.Dust(new Vector3(transform.position.x, 0.05f, 0f), 6, 1.5f);
+            GameAudio.Sfx("whoosh");
+            Motion(dt, 0f);
+            return;
+        }
 
         if (target != null && cur == null) facing = target.transform.position.x >= transform.position.x ? 1 : -1;
 
         float dx = 0f;
         if (cur != null)
         {
-            mt += dt;
+            mt += dt * (hasteT > 0f ? 1.35f : 1f);
             float u = mt / cur.dur;
-            float want = cur.step * Mathf.Clamp01(u / Mathf.Max(0.01f, cur.hitAt));
+            float want = cur.step * Mathf.Clamp01((u - cur.stepFrom) / Mathf.Max(0.01f, cur.hitAt - cur.stepFrom));
             dx = (want - stepped) * facing;
             stepped = want;
-            if (!hitDone && u >= cur.hitAt) { hitDone = true; DoHit(cur); }
-            if (cur != null && cur.hit2At > 0f && !hit2Done && u >= cur.hit2At) { hit2Done = true; DoHit(cur); }
-            if (hitDone && cur != null && buf != null && cur.next != null &&
-                ((buf == "U" && (cur.name == "jab" || cur.name == "cross")) || (buf == "H" && cur.name == "kick1")))
+            if (cur.teleportAt >= 0f && !tpDone && u >= cur.teleportAt) { tpDone = true; TeleportBehind(); }
+            float[] hs = cur.Hits;
+            while (cur != null && hitIdx < hs.Length && u >= hs[hitIdx])
+            {
+                hitIdx++;
+                hitDone = true;
+                if (cur.ability > 0) CastAbility(cur.ability); else DoHit(cur);
+            }
+            // once a move has landed it can be cancelled into an ability or the next combo hit
+            if (hitDone && cur != null && IsAbilityKey(buf) && CanCast(buf[0] - '0')) StartCast(buf[0] - '0');
+            else if (hitDone && cur != null && buf != null && cur.next != null &&
+                ((buf == "U" && (cur.name == "jab" || cur.name == "cross")) || (buf == "H" && cur.name == "kick1") || (buf == "J" && cur.name == "slash")))
                 StartMove(cur.next);
             else if (u >= 1f || (cur.air && Grounded && mt > 0.15f)) cur = null;
         }
@@ -1042,9 +1719,17 @@ public class Fighter : MonoBehaviour
             blocking = it.block && Grounded;
             if (!blocking)
             {
-                dx = it.move * (isPlayer ? 4.5f : 3.5f) * dt;
+                float spd = (isPlayer ? 4.5f : 3.5f) * (hasteT > 0f ? 1.35f : 1f) * (it.move * facing < 0f ? 0.95f : 1f);
+                dx = it.move * spd * dt;
                 moving = it.move != 0f && Grounded;
-                if (it.jump && Grounded) vy = 9f;
+                moveDir = it.move;
+                if (it.jump && Grounded && crouchT <= 0f) crouchT = 0.09f;
+                if (crouchT > 0f)
+                {
+                    // a short crouch before take-off
+                    crouchT -= dt;
+                    if (crouchT <= 0f && Grounded) { vy = 9.5f; Fx.Dust(new Vector3(transform.position.x, 0.05f, 0f), 5, 1.2f); }
+                }
                 if (buf != null)
                 {
                     if (!Grounded) { if (buf == "U" || buf == "H" || buf == "D") StartMove("jumpkick"); }
@@ -1053,6 +1738,8 @@ public class Fighter : MonoBehaviour
                     else if (buf == "D") StartMove("sweep");
                     else if (buf == "J") StartMove("slash");
                     else if (buf == "K") StartMove("smash");
+                    else if (IsAbilityKey(buf)) { if (CanCast(buf[0] - '0')) StartCast(buf[0] - '0'); else buf = null; }
+                    else if (buf == "O") { if (shuriken > 0) { shuriken--; StartMove("throw"); } else buf = null; }
                     else if (buf == "I" && energy >= 100f) StartMove("power");
                     else buf = null;
                 }
@@ -1062,22 +1749,53 @@ public class Fighter : MonoBehaviour
     }
 
     // ---------- animation ----------
-    Pose Locomotion()
+    // idle breathing and weight shifts; a different walk forwards and backwards
+    Pose Locomotion(float dt)
     {
         Pose p = G();
-        float b = Mathf.Sin(Time.time * 2.2f + transform.position.x);
-        p.lean += b * 1.5f;
-        p.hipY = b * 0.02f;
-        p.wAng += b * 2f;
+        float t = Time.time + idSeed;
+        float br = Mathf.Sin(t * 2.4f), sway = Mathf.Sin(t * 1.1f);
+        p.lean += br * 2f + sway * 1.5f;
+        p.head = -br * 2f;
+        p.hipY = -0.03f - br * 0.025f;
+        p.hipX = sway * 0.04f;
+        p.thighF += br * 3f; p.shinF -= br * 4f;
+        p.wAng += br * 3f + sway * 2f;
+        p.wy += br * 0.03f;
         if (moving)
         {
-            walkT += Time.deltaTime * 9f;
-            float s = Mathf.Sin(walkT);
-            p.thighF = 20f + s * 30f;
-            p.shinF = -22f - Mathf.Max(0f, -s) * 40f;
-            p.thighB = -14f - s * 30f;
-            p.shinB = -12f - Mathf.Max(0f, s) * 40f;
+            bool fwd = moveDir * facing > 0f;
+            walkT += dt * (fwd ? 11f : 8.5f) * (hasteT > 0f ? 1.35f : 1f);
+            float s = Mathf.Sin(walkT), c = Mathf.Cos(walkT);
+            float amp = fwd ? 34f : 24f;
+            p.thighF = 20f + s * amp;
+            p.shinF = -24f - Mathf.Max(0f, -s) * 50f;
+            p.thighB = -14f - s * amp;
+            p.shinB = -14f - Mathf.Max(0f, s) * 50f;
+            p.hipY = -0.06f - Mathf.Abs(c) * 0.07f;
+            p.lean = fwd ? 14f + s * 2f : s * 1.5f;
+            p.hipX = fwd ? 0.08f : -0.06f;
+            p.wAng += fwd ? -6f + c * 5f : 10f;
+            p.wy += fwd ? c * 0.04f : 0.08f;
+            p.head = fwd ? -4f : 4f;
         }
+        return p;
+    }
+
+    Pose DashPose(bool forward)
+    {
+        return forward
+            ? K(p => { p.lean = 28; p.hipY = -0.2f; p.thighF = 60; p.shinF = -60; p.thighB = -50; p.shinB = -30; })
+            : K(p => { p.lean = -18; p.hipY = -0.2f; p.thighF = 40; p.shinF = -80; p.thighB = -10; p.shinB = -60; p.wy = 0.1f; });
+    }
+
+    Pose Victory()
+    {
+        float t = Time.time * 5f;
+        Pose p = VictoryPose.Clone();
+        p.hipY = Mathf.Abs(Mathf.Sin(t)) * 0.06f;
+        p.wAng += Mathf.Sin(t) * 6f;
+        p.lUp += Mathf.Sin(t) * 8f;
         return p;
     }
 
@@ -1085,31 +1803,92 @@ public class Fighter : MonoBehaviour
     {
         Pose target;
         float fall = 0f;
+        bounceY = 0f;
         bool down = Dead || downT > 0f;
         if (down)
         {
             downElapsed += dt;
-            target = DownPose;
-            fall = Mathf.Clamp01(downElapsed / 0.22f);
-            if (!Dead && downT < 0.45f) fall = Mathf.Clamp01(downT / 0.45f);
+            if (!Dead && downT < 0.55f)
+            {
+                // getting up: onto one knee, then back to the stance
+                target = KneelPose;
+                fall = Mathf.Clamp01((downT - 0.18f) / 0.37f);
+            }
+            else
+            {
+                target = DownPose;
+                fall = Mathf.Clamp01(downElapsed / 0.22f);
+                if (downElapsed >= 0.22f && !groundHit)
+                {
+                    groundHit = true;
+                    Fx.Dust(new Vector3(transform.position.x - facing * 1.2f, 0.05f, 0f), 10, 2.2f);
+                    Shake = Mathf.Max(Shake, 0.1f);
+                }
+                if (downElapsed > 0.22f && downElapsed < 0.5f) bounceY = Mathf.Sin((downElapsed - 0.22f) / 0.28f * Mathf.PI) * 0.18f;
+            }
         }
-        else if (stun > 0f) target = HitPose;
+        else if (victory) target = Victory();
+        else if (dashT > 0f) target = DashPose(dashDir * facing > 0f);
+        else if (stun > 0f) target = hitVariant == 1 ? HitPose2 : HitPose;
         else if (cur != null) target = cur.Sample(mt / cur.dur);
         else if (blocking) target = BlockPose;
-        else if (!Grounded) target = AirPose;
-        else target = Locomotion();
+        else if (crouchT > 0f || landT > 0f) target = CrouchPose;
+        else if (!Grounded) target = vy > 0f ? AirPose : FallPose;
+        else target = Locomotion(dt);
+        if (landT > 0f) landT -= dt;
+        if (!down) groundHit = false;
 
-        disp = disp == null ? target.Clone() : Pose.Lerp(disp, target, 1f - Mathf.Exp(-dt * (cur != null ? 36f : 22f)));
+        float rate = cur != null ? 38f : stun > 0f ? 30f : 18f;
+        disp = disp == null ? target.Clone() : Pose.Lerp(disp, target, 1f - Mathf.Exp(-dt * rate));
+        Pose show = disp;
         if (shockT > 0f)
         {
-            Pose j = disp.Clone();
-            j.lean += Random.Range(-12f, 12f);
-            j.lUp += Random.Range(-30f, 30f);
-            j.thighF += Random.Range(-15f, 15f);
-            j.thighB += Random.Range(-15f, 15f);
-            ApplyPose(j, fall);
+            show = disp.Clone();
+            show.lean += Random.Range(-12f, 12f);
+            show.lUp += Random.Range(-30f, 30f);
+            show.thighF += Random.Range(-15f, 15f);
+            show.thighB += Random.Range(-15f, 15f);
         }
-        else ApplyPose(disp, fall);
+        ApplyPose(show, fall);
+        UpdateTrails();
+        UpdateFlash();
+        // blink while invulnerable after getting up
+        bool vis = invulnT <= 0f || dashT > 0f || !controlsEnabled || ((int)(Time.time * 14f) & 1) == 0;
+        if (vis != shown && rends != null)
+        {
+            shown = vis;
+            foreach (var r in rends) if (r != null) r.enabled = vis;
+        }
+    }
+
+    void UpdateTrails()
+    {
+        if (wTrail == null) return;
+        float u = cur != null ? mt / cur.dur : 0f;
+        bool live = cur != null && controlsEnabled;
+        wTrail.emitting = live && (cur.weaponMove || cur.power) && u > 0.15f && u < 0.9f;
+        fTrail.emitting = live && cur.kick && u > 0.2f && u < 0.85f;
+    }
+
+    // a white flash over the whole body when a hit lands
+    void UpdateFlash()
+    {
+        if (!flashDirty || rends == null) return;
+        if (mpb == null) mpb = new MaterialPropertyBlock();
+        flashT -= Time.unscaledDeltaTime;
+        if (flashT <= 0f)
+        {
+            flashDirty = false;
+            for (int i = 0; i < rends.Length; i++) if (rends[i] != null) rends[i].SetPropertyBlock(null);
+            return;
+        }
+        float k = Mathf.Clamp01(flashT / 0.1f) * 0.85f;
+        for (int i = 0; i < rends.Length; i++)
+        {
+            if (rends[i] == null) continue;
+            mpb.SetColor("_Color", Color.Lerp(baseCols[i], Color.white, k));
+            rends[i].SetPropertyBlock(mpb);
+        }
     }
 
     static float Leg(float th, float sh)
@@ -1134,8 +1913,11 @@ public class Fighter : MonoBehaviour
 
     void ApplyPose(Pose p, float fall)
     {
-        Quaternion yaw = Quaternion.Euler(0, (facing == 1 ? 0 : 180) + yawOffset, 0);
-        transform.rotation = yaw;
+        // turn around smoothly instead of snapping; the winner turns a little toward the camera
+        float wantYaw = (facing == 1 ? 0f : 180f) + yawOffset + (victory ? facing * 35f : 0f);
+        yawCur = snapYaw ? wantYaw : Mathf.LerpAngle(yawCur, wantYaw, 1f - Mathf.Exp(-Time.deltaTime * 16f));
+        snapYaw = false;
+        transform.rotation = Quaternion.Euler(0f, yawCur, 0f);
 
         // keep the lowest foot on the ground
         float fF = Leg(p.thighF, p.shinF), fB = Leg(p.thighB, p.shinB);
@@ -1172,11 +1954,17 @@ public class Fighter : MonoBehaviour
         upL.localRotation = Quaternion.Euler(0, 0, Mathf.Lerp(p.lUp, a1, w));
         foreL.localRotation = Quaternion.Euler(0, 0, Mathf.Lerp(p.lFo, a2, w));
 
+        float dtp = Mathf.Max(Time.deltaTime, 0.0001f);
+        float vx = Mathf.Clamp((transform.position.x - lastX) / dtp * facing, -12f, 12f);
+        lastX = transform.position.x;
+        if (capeP != null)
+        {
+            float cw = Mathf.Clamp(-4f - Mathf.Max(0f, vx) * 4f + p.lean * 0.8f - Mathf.Max(0f, -vy) * 2.5f, -75f, 15f);
+            capeA = Mathf.SmoothDampAngle(capeA, cw, ref capeV, 0.12f);
+            capeP.localRotation = Quaternion.Euler(0f, 0f, capeA);
+        }
         if (pony1 != null)
         {
-            float dtp = Mathf.Max(Time.deltaTime, 0.0001f);
-            float vx = Mathf.Clamp((transform.position.x - lastX) / dtp * facing, -12f, 12f);
-            lastX = transform.position.x;
             float want = -28f - vx * 3f - p.lean * 0.6f;
             ponyA = Mathf.SmoothDampAngle(ponyA, want, ref ponyV, 0.09f);
             pony1.localRotation = Quaternion.Euler(0, 0, ponyA);
@@ -1187,6 +1975,6 @@ public class Fighter : MonoBehaviour
 
         // knocked down: tip over backwards, feet stay put
         body.localRotation = Quaternion.Euler(0, 0, 90f * fall);
-        body.localPosition = new Vector3(0, 0.32f * fall, 0);
+        body.localPosition = new Vector3(0, 0.32f * fall + bounceY, 0);
     }
 }

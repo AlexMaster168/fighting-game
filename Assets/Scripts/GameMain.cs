@@ -25,6 +25,11 @@ public class GameMain : MonoBehaviour
     const int MaxLevel = 30;
     static readonly string[] OppNames = { "Случайный", "Легион", "Династия", "Вестники", "Гильдия Теней" };
     int hairIdx, level = 1;
+    int eqSkin, arenaSel = -1, curArena = -1;
+    Light sun, fill;
+    GameObject arenaRoot;
+    float slowMo, koZoom;
+    bool skinTab;
     float countdown, roundTime, koTimer;
     enum RState { Intro, Fight, KO }
     RState rs;
@@ -36,7 +41,7 @@ public class GameMain : MonoBehaviour
     Vector2 scroll;
     Faction enemyFaction;
 
-    bool demo, demoFemale, demoNatural, menuShot, menuShotDone, demoFastKo;
+    bool demo, demoFemale, demoNatural, menuShot, menuShotDone, demoFastKo, skinShot;
     float demoLog;
     float demoT;
     int demoShots;
@@ -67,11 +72,16 @@ public class GameMain : MonoBehaviour
         owned.RemoveWhere(id => Db.Get(id) == null);
         owned.Add("W_0_0_1"); owned.Add("H_0_0"); owned.Add("A_0_0");
         owned.Add(eqW); owned.Add(eqH); owned.Add(eqA);
+        eqSkin = Mathf.Clamp(PlayerPrefs.GetInt("skin", 0), 0, Db.Skins.Length - 1);
+        arenaSel = Mathf.Clamp(PlayerPrefs.GetInt("arena", -1), -1, Arena.Names.Length - 1);
+        owned.Add("S0");
+        if (!owned.Contains(Db.Skins[eqSkin].id)) eqSkin = 0;
         state = PlayerPrefs.GetInt("chosen", 0) == 1 ? State.Menu : State.Select;
     }
 
     void Save()
     {
+        if (demo) return;   // test runs must never touch the real save
         PlayerPrefs.SetString("coins", coins.ToString());
         PlayerPrefs.SetInt("level", level);
         PlayerPrefs.SetInt("oppF", oppFaction);
@@ -81,6 +91,8 @@ public class GameMain : MonoBehaviour
         PlayerPrefs.SetString("eqW", eqW);
         PlayerPrefs.SetString("eqH", eqH);
         PlayerPrefs.SetString("eqA", eqA);
+        PlayerPrefs.SetInt("skin", eqSkin);
+        PlayerPrefs.SetInt("arena", arenaSel);
         PlayerPrefs.SetInt("chosen", 1);
         PlayerPrefs.Save();
     }
@@ -107,33 +119,58 @@ public class GameMain : MonoBehaviour
         cam.backgroundColor = new Color(0.05f, 0.05f, 0.1f);
         foreach (var l in FindObjectsByType<Light>(FindObjectsSortMode.None)) Destroy(l.gameObject);
 
-        var sun = new GameObject("Sun").AddComponent<Light>();
+        // lights are shared by every arena; each map sets their colour and angle
+        sun = new GameObject("Sun").AddComponent<Light>();
         sun.type = LightType.Directional;
-        sun.intensity = 1.15f;
         sun.shadows = LightShadows.Soft;
-        sun.transform.rotation = Quaternion.Euler(48f, -32f, 0f);
-        var fill = new GameObject("Fill").AddComponent<Light>();
+        sun.shadowStrength = 0.85f;
+        fill = new GameObject("Fill").AddComponent<Light>();
         fill.type = LightType.Directional;
-        fill.intensity = 0.4f;
-        fill.color = new Color(0.6f, 0.7f, 1f);
-        fill.transform.rotation = Quaternion.Euler(20f, 150f, 0f);
-        RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
-        RenderSettings.ambientLight = new Color(0.4f, 0.4f, 0.5f);
+        fill.shadows = LightShadows.None;
+
+        QualitySettings.antiAliasing = 4;
+        QualitySettings.shadows = ShadowQuality.All;
+        QualitySettings.shadowResolution = ShadowResolution.VeryHigh;
+        QualitySettings.shadowDistance = 45f;
+        QualitySettings.shadowCascades = 2;
+        QualitySettings.pixelLightCount = 8;
+        cam.allowMSAA = true;
 
         GameAudio.Boot(gameObject);
-        BuildEnvironment();
         string[] args = System.Environment.GetCommandLineArgs();
         demo = System.Array.IndexOf(args, "-demo") >= 0;
         demoFemale = System.Array.IndexOf(args, "-female") >= 0;
         demoNatural = System.Array.IndexOf(args, "-natural") >= 0;
         menuShot = System.Array.IndexOf(args, "-menushot") >= 0;
         demoFastKo = System.Array.IndexOf(args, "-fastko") >= 0;
+        skinShot = System.Array.IndexOf(args, "-skinshot") >= 0;
+        if (skinShot)
+        {
+            // every skin side by side without armour, for checking how they look
+            demo = true;
+            LoadArena(2);
+            state = State.Menu;
+            for (int i = 0; i < Db.Skins.Length; i++)
+            {
+                Fighter f = MakeFighter("Skin" + i, false, -7f + i * 2f, Db.Get("W_2_5_1"), null, null, i % 2 == 1, Hairs[i % Hairs.Length], i);
+                f.yawOffset = 60f;
+            }
+            AimCam(new Vector3(0f, 2.2f, 0f), 3f, -13f);
+            menuShot = true;
+            return;
+        }
         if (demo)
         {
+            Fighter.DebugLog = true;
             // AI vs AI in the best gear, screenshots on a timer: used to eyeball the animations without a human
             female = demoFemale;
             eqW = "W_0_6_3"; eqH = "H_0_3"; eqA = "A_0_3";
-            foreach (string a in args) if (a.StartsWith("-weapon=")) eqW = a.Substring(8);
+            foreach (string a in args)
+            {
+                if (a.StartsWith("-weapon=")) eqW = a.Substring(8);
+                if (a.StartsWith("-arena=")) arenaSel = int.Parse(a.Substring(7));
+                if (a.StartsWith("-skin=")) eqSkin = int.Parse(a.Substring(6));
+            }
             StartFight();
             player.autoPlay = true;
             if (!demoNatural) { player.energy = 100f; player.dmgMul = 5f; }
@@ -141,30 +178,25 @@ public class GameMain : MonoBehaviour
             level = 3;
             return;
         }
+        LoadArena(arenaSel < 0 ? 0 : arenaSel);
         if (state == State.Select) ShowSelect(); else ShowMenu();
     }
 
-    void BuildEnvironment()
+    void LoadArena(int idx)
     {
-        Transform env = new GameObject("Environment").transform;
-        Fighter.Part(env, "floor", PrimitiveType.Cube, new Vector3(0, -0.5f, 2), new Vector3(40, 1, 14), new Color(0.22f, 0.2f, 0.22f), Vector3.zero);
-        Fighter.Part(env, "wall", PrimitiveType.Cube, new Vector3(0, 7, 8.5f), new Vector3(40, 16, 1), new Color(0.11f, 0.11f, 0.19f), Vector3.zero);
-        Fighter.Part(env, "moon", PrimitiveType.Sphere, new Vector3(7, 9, 8), Vector3.one * 3.2f, new Color(0.95f, 0.95f, 0.8f), Vector3.zero);
-        for (int i = -4; i <= 4; i++)
-        {
-            Fighter.Part(env, "pillar", PrimitiveType.Cylinder, new Vector3(i * 4f, 3.2f, 5.5f), new Vector3(0.95f, 3.2f, 0.95f), new Color(0.3f, 0.28f, 0.32f), Vector3.zero);
-            Fighter.Part(env, "torch", PrimitiveType.Sphere, new Vector3(i * 4f, 6.6f, 5.5f), Vector3.one * 0.5f, new Color(1f, 0.6f, 0.2f), Vector3.zero);
-            Fighter.Part(env, "stone", PrimitiveType.Cube, new Vector3(i * 4f + 2f, 0.2f, 1.2f), new Vector3(0.6f, 0.4f, 0.6f), new Color(0.3f, 0.3f, 0.33f), new Vector3(0, i * 20f, 0));
-        }
+        if (curArena == idx && arenaRoot != null) return;
+        if (arenaRoot != null) Destroy(arenaRoot);
+        curArena = idx;
+        arenaRoot = Arena.Build(idx, sun, fill, cam);
     }
 
-    Fighter MakeFighter(string name, bool isPlayer, float x, Item w, Item h, Item a, bool fem, Color hairCol)
+    Fighter MakeFighter(string name, bool isPlayer, float x, Item w, Item h, Item a, bool fem, Color hairCol, int skinIdx)
     {
         var go = new GameObject(name);
         go.transform.position = new Vector3(x, 0, 0);
         var f = go.AddComponent<Fighter>();
         f.isPlayer = isPlayer;
-        f.weapon = w; f.helmet = h; f.armor = a; f.female = fem; f.hair = hairCol;
+        f.weapon = w; f.helmet = h; f.armor = a; f.female = fem; f.hair = hairCol; f.skinId = skinIdx;
         f.Build();
         return f;
     }
@@ -179,6 +211,7 @@ public class GameMain : MonoBehaviour
     {
         cam.transform.position = new Vector3(at.x, height, back);
         cam.transform.rotation = Quaternion.LookRotation(at - cam.transform.position);
+        cam.fieldOfView = 50f;
     }
 
     // ---------- hero select ----------
@@ -188,8 +221,8 @@ public class GameMain : MonoBehaviour
         ClearAll();
         state = State.Select;
         Item w = Db.Get(eqW), h = Db.Get(eqH), a = Db.Get(eqA);
-        prevM = MakeFighter("PreviewM", false, -1.9f, w, h, a, false, Hairs[hairIdx]);
-        prevF = MakeFighter("PreviewF", false, 1.9f, w, h, a, true, Hairs[hairIdx]);
+        prevM = MakeFighter("PreviewM", false, -1.9f, w, h, a, false, Hairs[hairIdx], eqSkin);
+        prevF = MakeFighter("PreviewF", false, 1.9f, w, h, a, true, Hairs[hairIdx], eqSkin);
         AimCam(new Vector3(0, 2f, 0), 2.9f, -8.5f);
     }
 
@@ -204,7 +237,7 @@ public class GameMain : MonoBehaviour
     void RebuildPreview()
     {
         if (player != null) Destroy(player.gameObject);
-        player = MakeFighter("Player", true, -2.2f, Db.Get(eqW), Db.Get(eqH), Db.Get(eqA), female, Hairs[hairIdx]);
+        player = MakeFighter("Player", true, -2.2f, Db.Get(eqW), Db.Get(eqH), Db.Get(eqA), female, Hairs[hairIdx], eqSkin);
         player.yawOffset = -25f;
         AimCam(new Vector3(-2.2f, 2f, 0), 2.9f, -7.5f);
     }
@@ -212,16 +245,17 @@ public class GameMain : MonoBehaviour
     // ---------- fight ----------
     void StartFight()
     {
-        GameAudio.Music(true);
         ClearAll();
+        LoadArena(arenaSel < 0 ? Random.Range(0, Arena.Names.Length) : arenaSel);
+        GameAudio.MusicArena(curArena);
         state = State.Fight;
-        player = MakeFighter("Player", true, -3f, Db.Get(eqW), Db.Get(eqH), Db.Get(eqA), female, Hairs[hairIdx]);
+        player = MakeFighter("Player", true, -3f, Db.Get(eqW), Db.Get(eqH), Db.Get(eqA), female, Hairs[hairIdx], eqSkin);
         player.maxHp = player.hp = 300f;
 
         enemyFaction = oppFaction < 0 ? (Faction)Random.Range(0, 4) : (Faction)oppFaction;
         int maxTier = Mathf.Min(3, 1 + level / 2);
         enemy = MakeFighter("Enemy", false, 3f, Pick(Slot.Weapon, maxTier), Pick(Slot.Helmet, maxTier), Pick(Slot.Armor, maxTier),
-                            Random.value < 0.5f, Hairs[Random.Range(0, Hairs.Length)]);
+                            Random.value < 0.5f, Hairs[Random.Range(0, Hairs.Length)], Random.Range(0, Db.Skins.Length));
         enemy.maxHp = enemy.hp = 150f + 25f * level;
         enemy.dmgMul = Mathf.Min(3f, 0.8f + 0.08f * level);
         enemy.aiLevel = Mathf.Min(level, 10);
@@ -233,8 +267,10 @@ public class GameMain : MonoBehaviour
 
     void BeginRound()
     {
-        player.ResetForRound(-3f);
-        enemy.ResetForRound(3f);
+        Hazard.ClearAll();
+        Fighter.Zoom = 0f;
+        player.ResetForRound(-3.5f);
+        enemy.ResetForRound(3.5f);
         if (demo) Debug.Log("BEGIN round " + round + " energy player=" + player.energy.ToString("0.0") + " enemy=" + enemy.energy.ToString("0.0"));
         rs = RState.Intro;
         countdown = 2.2f;
@@ -251,6 +287,7 @@ public class GameMain : MonoBehaviour
     void Update()
     {
         if (Fighter.HitStop > 0f) { Fighter.HitStop -= Time.unscaledDeltaTime; Time.timeScale = 0.05f; }
+        else if (slowMo > 0f) { slowMo -= Time.unscaledDeltaTime; Time.timeScale = 0.3f; }   // K.O. in slow motion
         else Time.timeScale = 1f;
         float dt = Time.deltaTime;
         if (demo) DemoTick();
@@ -292,6 +329,8 @@ public class GameMain : MonoBehaviour
                     koText = (enemy.Dead || player.Dead) ? "K.O." : "ВРЕМЯ";
                     rs = RState.KO;
                     koTimer = 2.8f;
+                    slowMo = (enemy.Dead || player.Dead) ? 1.3f : 0f;
+                    (playerTakes ? player : enemy).victory = true;
                 }
             }
             else
@@ -323,7 +362,7 @@ public class GameMain : MonoBehaviour
         if (demoT > 3f + demoShots * 0.6f && demoShots < 60)
         {
             string dir = System.Environment.GetEnvironmentVariable("SA_SHOTS") ?? ".";
-            ScreenCapture.CaptureScreenshot(dir + "/demo_" + (demoFemale ? "f" : "m") + "_" + demoShots + ".png");
+            ScreenCapture.CaptureScreenshot(dir + "/demo_" + (demoFemale ? "f" : "m") + curArena + "_" + demoShots + ".png");
             demoShots++;
         }
         if (demoT > 44f) Application.Quit();
@@ -336,7 +375,10 @@ public class GameMain : MonoBehaviour
         if (player == null || enemy == null) return;
         float mid = (player.transform.position.x + enemy.transform.position.x) * 0.5f;
         float sep = Mathf.Abs(player.transform.position.x - enemy.transform.position.x);
-        Vector3 pos = new Vector3(mid * 0.6f, 3f, -9f - sep * 0.4f);
+        koZoom = Mathf.MoveTowards(koZoom, rs == RState.KO && state == State.Fight ? 1f : 0f, Time.unscaledDeltaTime * 1.5f);
+        Vector3 pos = new Vector3(mid * 0.6f, 3f - koZoom * 0.6f, -9f - sep * 0.4f + koZoom * 2.8f);
+        cam.fieldOfView = Mathf.Lerp(50f, 40f, Fighter.Zoom);
+        Fighter.Zoom = Mathf.MoveTowards(Fighter.Zoom, 0f, Time.unscaledDeltaTime * 0.9f);
         cam.transform.position = Vector3.Lerp(cam.transform.position, pos, Time.deltaTime * 4f);
         Quaternion rot = Quaternion.LookRotation(new Vector3(mid * 0.6f, 2.1f, 0f) - cam.transform.position);
         cam.transform.rotation = Quaternion.Slerp(cam.transform.rotation, rot, Time.deltaTime * 4f);
@@ -434,13 +476,16 @@ public class GameMain : MonoBehaviour
         GUI.Label(new UnityEngine.Rect(vw - 340, 578, 132, 42), "Уровень " + level, small);
         if (GUI.Button(new UnityEngine.Rect(vw - 204, 578, 40, 42), "+")) { level = Mathf.Min(MaxLevel, level + 1); Save(); }
         if (GUI.Button(new UnityEngine.Rect(vw - 160, 578, 52, 42), "+5")) { level = Mathf.Min(MaxLevel, level + 5); Save(); }
+        if (GUI.Button(new UnityEngine.Rect(vw - 430, 628, 44, 42), "<")) { arenaSel = arenaSel <= -1 ? Arena.Names.Length - 1 : arenaSel - 1; Save(); if (arenaSel >= 0) LoadArena(arenaSel); }
+        GUI.Label(new UnityEngine.Rect(vw - 384, 628, 228, 42), "Арена: " + (arenaSel < 0 ? "случайная" : Arena.Names[arenaSel]), small);
+        if (GUI.Button(new UnityEngine.Rect(vw - 152, 628, 44, 42), ">")) { arenaSel = arenaSel >= Arena.Names.Length - 1 ? -1 : arenaSel + 1; Save(); if (arenaSel >= 0) LoadArena(arenaSel); }
 
         Rect(16, 16, 400, 176, new Color(0, 0, 0, 0.65f));
         GUI.Label(new UnityEngine.Rect(30, 24, 380, 30), (female ? "<b>ДЕВОЧКА</b>" : "<b>МАЛЬЧИК</b>") + "   ур. " + level);
         GUI.Label(new UnityEngine.Rect(30, 56, 380, 30), "Оружие: <color=#" + Hex(w.faction) + ">" + w.name + "</color>");
         GUI.Label(new UnityEngine.Rect(30, 84, 380, 30), "Шлем: <color=#" + Hex(h.faction) + ">" + h.name + "</color>");
         GUI.Label(new UnityEngine.Rect(30, 112, 380, 30), "Броня: <color=#" + Hex(a.faction) + ">" + a.name + "</color>");
-        GUI.Label(new UnityEngine.Rect(30, 148, 380, 30), "УРОН " + w.damage + "    ЗАЩИТА " + (h.defense + a.defense));
+        GUI.Label(new UnityEngine.Rect(30, 148, 380, 30), "УРОН " + w.damage + "    ЗАЩИТА " + (h.defense + a.defense) + "    скин: " + Db.Skins[eqSkin].name);
         GUI.Label(new UnityEngine.Rect(16, 686, vw, 30), "ЛКМ + движение мышью — покрутить героя");
     }
 
@@ -450,36 +495,72 @@ public class GameMain : MonoBehaviour
         GUILayout.BeginArea(new UnityEngine.Rect(vw - 550, 10, 540, 700));
         GUILayout.Label("Монеты: <color=#ffd040>" + coins.ToString("N0") + "</color>   ·   одеваем: " + (female ? "девочку" : "мальчика"));
         GUILayout.BeginHorizontal();
-        string[] tn = { "Оружие", "Шлемы", "Броня" };
-        for (int i = 0; i < 3; i++) if (GUILayout.Button(tn[i], GUILayout.Height(40))) { tab = (Slot)i; scroll = Vector2.zero; }
+        string[] tn = { "Оружие", "Шлемы", "Броня", "Скины" };
+        for (int i = 0; i < 4; i++)
+            if (GUILayout.Button(tn[i], GUILayout.Height(40)))
+            {
+                skinTab = i == 3;
+                if (i < 3) tab = (Slot)i;
+                scroll = Vector2.zero;
+            }
         GUILayout.EndHorizontal();
-        GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Все", GUILayout.Height(34))) factionFilter = -1;
-        for (int f = 0; f < 4; f++)
-            if (GUILayout.Button("<color=#" + Hex((Faction)f) + ">" + (Faction)f + "</color>", GUILayout.Height(34))) factionFilter = f;
-        GUILayout.EndHorizontal();
-
-        if (factionFilter >= 0) GUILayout.Label("<i>" + (Faction)factionFilter + " — " + Db.Trait((Faction)factionFilter) + "</i>");
-        scroll = GUILayout.BeginScrollView(scroll, GUILayout.Height(520));
-        foreach (Item it in Db.All)
+        if (skinTab) SkinList();
+        else
         {
-            if (it.slot != tab || (factionFilter >= 0 && (int)it.faction != factionFilter)) continue;
-            bool have = owned.Contains(it.id);
-            bool eq = it.id == eqW || it.id == eqH || it.id == eqA;
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Все", GUILayout.Height(34))) factionFilter = -1;
+            for (int f = 0; f < 4; f++)
+                if (GUILayout.Button("<color=#" + Hex((Faction)f) + ">" + (Faction)f + "</color>", GUILayout.Height(34))) factionFilter = f;
+            GUILayout.EndHorizontal();
+
+            if (factionFilter >= 0) GUILayout.Label("<i>" + (Faction)factionFilter + " — " + Db.Trait((Faction)factionFilter) + "</i>");
+            scroll = GUILayout.BeginScrollView(scroll, GUILayout.Height(520));
+            foreach (Item it in Db.All)
+            {
+                if (it.slot != tab || (factionFilter >= 0 && (int)it.faction != factionFilter)) continue;
+                bool have = owned.Contains(it.id);
+                bool eq = it.id == eqW || it.id == eqH || it.id == eqA;
+                GUILayout.BeginHorizontal(GUI.skin.box);
+                string stats = it.slot == Slot.Weapon
+                    ? "УРОН " + it.damage + "  ДЛИНА " + it.reach + "  СКОР " + it.speed + "  КРИТ " + Mathf.Round(it.crit * 100f) + "%"
+                    : "ЗАЩИТА " + it.defense;
+                GUILayout.Label("<b><color=#" + Hex(it.faction) + ">" + it.name + "</color></b>\n" + it.faction + " · " + stats, GUILayout.Width(330));
+                string label = eq ? "НАДЕТО" : have ? "Надеть" : "Купить\n" + it.price.ToString("N0");
+                GUI.enabled = !eq && (have || coins >= it.price);
+                if (GUILayout.Button(label, GUILayout.Width(150), GUILayout.Height(54))) BuyOrEquip(it, have);
+                GUI.enabled = true;
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndScrollView();
+        }
+        if (GUILayout.Button("Назад", GUILayout.Height(40))) ShowMenu();
+        GUILayout.EndArea();
+    }
+
+    void SkinList()
+    {
+        GUILayout.Label("<i>Скин меняет одежду, кожу и детали героя. Броня и шлем надеваются поверх.</i>");
+        scroll = GUILayout.BeginScrollView(scroll, GUILayout.Height(560));
+        for (int i = 0; i < Db.Skins.Length; i++)
+        {
+            Skin sk = Db.Skins[i];
+            bool have = owned.Contains(sk.id), eq = eqSkin == i;
             GUILayout.BeginHorizontal(GUI.skin.box);
-            string stats = it.slot == Slot.Weapon
-                ? "УРОН " + it.damage + "  ДЛИНА " + it.reach + "  СКОР " + it.speed + "  КРИТ " + Mathf.Round(it.crit * 100f) + "%"
-                : "ЗАЩИТА " + it.defense;
-            GUILayout.Label("<b><color=#" + Hex(it.faction) + ">" + it.name + "</color></b>\n" + it.faction + " · " + stats, GUILayout.Width(330));
-            string label = eq ? "НАДЕТО" : have ? "Надеть" : "Купить\n" + it.price.ToString("N0");
-            GUI.enabled = !eq && (have || coins >= it.price);
-            if (GUILayout.Button(label, GUILayout.Width(150), GUILayout.Height(54))) BuyOrEquip(it, have);
+            string col = ColorUtility.ToHtmlStringRGB(Color.Lerp(sk.cloth, Color.white, 0.4f));
+            GUILayout.Label("<b><color=#" + col + ">" + sk.name + "</color></b>\n" + sk.desc, GUILayout.Width(330));
+            string label = eq ? "НАДЕТО" : have ? "Надеть" : "Купить\n" + sk.price.ToString("N0");
+            GUI.enabled = !eq && (have || coins >= sk.price);
+            if (GUILayout.Button(label, GUILayout.Width(150), GUILayout.Height(54)))
+            {
+                if (!have) { coins -= sk.price; owned.Add(sk.id); }
+                eqSkin = i;
+                Save();
+                RebuildPreview();
+            }
             GUI.enabled = true;
             GUILayout.EndHorizontal();
         }
         GUILayout.EndScrollView();
-        if (GUILayout.Button("Назад", GUILayout.Height(40))) ShowMenu();
-        GUILayout.EndArea();
     }
 
     void BuyOrEquip(Item it, bool have)
@@ -498,6 +579,43 @@ public class GameMain : MonoBehaviour
         if (sp.z <= 0) return;
         float x = sp.x / s - 60f, y = (Screen.height - sp.y) / s - 24f;
         Bar(x, y, 120, 12, f.hp / f.maxHp, c);
+        string b = f.Buffs;
+        if (b.Length > 0)
+            GUI.Label(new UnityEngine.Rect(x - 80, y - 24, 280, 22), b, new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontSize = 14, richText = true });
+    }
+
+    // energy bar split into three charges
+    void SegBar(float x, float y, float w, float h, Fighter f)
+    {
+        Bar(x, y, w, h, f.energy / 100f, new Color(0.75f, 0.35f, 1f));
+        for (int k = 1; k < 3; k++) Rect(x + w * k / 3f - 1f, y - 2f, 3f, h + 4f, new Color(0.7f, 0.65f, 0.4f, 0.95f));
+    }
+
+    void AbilityPanel()
+    {
+        int ch = player.Charges;
+        var st = new GUIStyle(GUI.skin.label) { fontSize = 14, richText = true, alignment = TextAnchor.MiddleCenter, wordWrap = true };
+        // shurikens: no cost, three in the pouch, they come back on their own
+        {
+            float x = 24 + 4 * 158, y = 598;
+            bool ok = player.shuriken > 0;
+            Rect(x, y, 150, 58, ok ? new Color(0.15f, 0.2f, 0.28f, 0.85f) : new Color(0f, 0f, 0f, 0.55f));
+            Rect(x, y, 150, 3, new Color(0.8f, 0.85f, 0.95f));
+            GUI.Label(new UnityEngine.Rect(x, y + 3, 150, 34), (ok ? "<color=#ffffff>" : "<color=#888888>") + "<b>[O]</b> Сюрикен</color>", st);
+            for (int k = 0; k < Fighter.MaxShuriken; k++) Rect(x + 75 - Fighter.MaxShuriken * 9 + k * 18, y + 42, 14, 8, k < player.shuriken ? new Color(0.85f, 0.9f, 1f) : new Color(0.3f, 0.3f, 0.3f));
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            int a = i + 1;
+            int cost = a == 4 ? 3 : player.AbilityCost(a);
+            string nm = a == 4 ? player.PowerName : player.AbilityName(a);
+            bool ok = ch >= cost;
+            float x = 24 + i * 158, y = 598;
+            Rect(x, y, 150, 58, ok ? new Color(0.25f, 0.1f, 0.35f, 0.85f) : new Color(0f, 0f, 0f, 0.55f));
+            Rect(x, y, 150, 3, ok ? Db.FactionColor(player.weapon.faction) : new Color(0.3f, 0.3f, 0.3f));
+            GUI.Label(new UnityEngine.Rect(x, y + 3, 150, 34), (ok ? "<color=#ffffff>" : "<color=#888888>") + "<b>[" + (a == 4 ? "I" : a.ToString()) + "]</b> " + nm + "</color>", st);
+            for (int k = 0; k < cost; k++) Rect(x + 75 - cost * 9 + k * 18, y + 42, 14, 8, ok ? new Color(0.8f, 0.45f, 1f) : new Color(0.3f, 0.3f, 0.3f));
+        }
     }
 
     void FightGui(float vw, float s, GUIStyle big, GUIStyle mid)
@@ -505,13 +623,13 @@ public class GameMain : MonoBehaviour
         Rect(0, 0, vw, 92, new Color(0, 0, 0, 0.45f));
         GUI.Label(new UnityEngine.Rect(24, 8, 500, 26), "<b>" + (female ? "ДЕВОЧКА" : "МАЛЬЧИК") + "</b>   " + Db.Get(eqW).name);
         Bar(24, 36, 480, 26, player.hp / player.maxHp, new Color(0.25f, 0.85f, 0.35f));
-        Bar(24, 68, 300, 12, player.energy / 100f, new Color(0.75f, 0.35f, 1f));
-        GUI.Label(new UnityEngine.Rect(332, 62, 300, 24), player.energy >= 100f ? "<color=#ff80ff><b>СУПЕР: " + player.PowerName + " (I)</b></color>" : "суперсила " + Mathf.Floor(player.energy) + "%");
+        SegBar(24, 68, 300, 12, player);
+        GUI.Label(new UnityEngine.Rect(332, 62, 420, 24), "заряды <b>" + player.Charges + "/3</b>" + (player.Charges >= 3 ? "   <color=#ff80ff><b>УЛЬТА: " + player.PowerName + " (I)</b></color>" : ""));
 
         var right = new GUIStyle(GUI.skin.label) { fontSize = 16, richText = true, alignment = TextAnchor.MiddleRight };
         GUI.Label(new UnityEngine.Rect(vw - 524, 8, 500, 26), "<b><color=#" + Hex(enemyFaction) + ">" + enemyFaction + "</color></b>   " + enemy.weapon.name + "   ур. " + level, right);
         Bar(vw - 504, 36, 480, 26, enemy.hp / enemy.maxHp, new Color(0.9f, 0.27f, 0.22f));
-        Bar(vw - 504, 68, 300, 12, enemy.energy / 100f, new Color(0.75f, 0.35f, 1f));
+        SegBar(vw - 504, 68, 300, 12, enemy);
 
         HeadBar(player, s, new Color(0.25f, 0.85f, 0.35f));
         HeadBar(enemy, s, new Color(0.9f, 0.27f, 0.22f));
@@ -526,13 +644,15 @@ public class GameMain : MonoBehaviour
         }
         Rect(0, 664, vw, 56, new Color(0, 0, 0, 0.55f));
         GUI.Label(new UnityEngine.Rect(20, 668, vw, 24),
-            "A/D ход · W прыжок · <b>U</b> рука (жми ещё: джеб-кросс-апперкот) · <b>H</b> нога (ещё: раундхаус) · <b>S+H</b> подсечка · в прыжке H — удар ногой");
+            "A/D ход · <b>Shift</b> или A-A / D-D рывок (неуязвим) · W прыжок · <b>U</b> рука · <b>H</b> нога · <b>S+H</b> подсечка · <b>L</b> блок · <b>O</b> сюрикен · Esc меню");
         GUI.Label(new UnityEngine.Rect(20, 692, vw, 24),
-            "<b>J</b>/ЛКМ рубящий · <b>K</b>/ПКМ тяжёлый удар оружием · <b>L</b> блок (подсечку не блочит) · <b>I</b> суперсила: пламя / молния / свет / тьма · Esc меню");
+            "<b>J</b>/ЛКМ рубящий · <b>K</b>/ПКМ тяжёлый (у каждой фракции свои) · <b>1 2 3</b> способности за заряды, можно подряд · <b>I</b> ульта (3 заряда)");
+        AbilityPanel();
         if (rs == RState.Intro)
         {
             string t = countdown > 0.7f ? (pWins == 1 && eWins == 1 ? "ФИНАЛЬНЫЙ РАУНД" : "РАУНД " + round) : "БОЙ!";
             GUI.Label(new UnityEngine.Rect(0, 250, vw, 100), t, big);
+            GUI.Label(new UnityEngine.Rect(0, 340, vw, 30), Arena.Names[curArena], mid);
         }
         else if (rs == RState.KO)
         {

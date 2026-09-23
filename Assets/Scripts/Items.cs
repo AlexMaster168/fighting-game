@@ -18,6 +18,17 @@ public class Item
     public long price;
 }
 
+
+// a look for the hero: clothes, skin tone and a few extra details; armour and helmet go on top
+public class Skin
+{
+    public string id, name, desc;
+    public Color cloth, skinCol, accent, cape, eye;
+    public bool glowEyes, metal;
+    public int extra;
+    public long price;
+}
+
 public static class Db
 {
     public static readonly List<Item> All = new List<Item>();
@@ -74,6 +85,20 @@ public static class Db
         new[] { "Herald Robe", "Light Mail", "Radiant Plate", "Sunforged Armor" },
         new[] { "Shadow Garb", "Dark Mail", "Night Plate", "Abyss Armor" },
     };
+
+    public static readonly Skin[] Skins =
+    {
+        new Skin { id = "S0", name = "Классика", desc = "простая тёмная одежда", cloth = C(0.2f, 0.2f, 0.26f), skinCol = C(0.92f, 0.74f, 0.57f), accent = C(0.26f, 0.17f, 0.12f), eye = Color.black, price = 0 },
+        new Skin { id = "S1", name = "Ниндзя", desc = "чёрный костюм, красная повязка, маска", cloth = C(0.07f, 0.07f, 0.09f), skinCol = C(0.92f, 0.74f, 0.57f), accent = C(0.8f, 0.1f, 0.1f), eye = Color.black, extra = 1, price = 500000 },
+        new Skin { id = "S2", name = "Самурай", desc = "алое кимоно, золотой пояс, пучок", cloth = C(0.52f, 0.08f, 0.1f), skinCol = C(0.9f, 0.72f, 0.55f), accent = C(0.92f, 0.78f, 0.34f), eye = Color.black, extra = 2, price = 1500000 },
+        new Skin { id = "S3", name = "Королевский", desc = "белые одежды, золото, пурпурный плащ", cloth = C(0.9f, 0.9f, 0.95f), skinCol = C(0.95f, 0.8f, 0.66f), accent = C(0.95f, 0.8f, 0.3f), cape = C(0.45f, 0.1f, 0.6f), eye = C(0.1f, 0.3f, 0.8f), extra = 3, price = 3000000 },
+        new Skin { id = "S4", name = "Зомби", desc = "зелёная кожа, лохмотья, светящиеся глаза", cloth = C(0.28f, 0.32f, 0.22f), skinCol = C(0.55f, 0.72f, 0.46f), accent = C(0.35f, 0.25f, 0.18f), eye = C(0.5f, 1f, 0.3f), glowEyes = true, extra = 5, price = 5000000 },
+        new Skin { id = "S5", name = "Демон", desc = "красная кожа, рога, огненный взгляд", cloth = C(0.14f, 0.02f, 0.03f), skinCol = C(0.72f, 0.18f, 0.15f), accent = C(0.1f, 0.08f, 0.08f), eye = C(1f, 0.6f, 0.1f), glowEyes = true, extra = 4, price = 10000000 },
+        new Skin { id = "S6", name = "Робот", desc = "металлический корпус, антенна, ядро", cloth = C(0.42f, 0.45f, 0.5f), skinCol = C(0.62f, 0.65f, 0.7f), accent = C(0.2f, 0.9f, 1f), eye = C(0.2f, 0.9f, 1f), glowEyes = true, metal = true, extra = 6, price = 25000000 },
+        new Skin { id = "S7", name = "Золотой воин", desc = "золото с головы до ног и сияющая аура", cloth = C(0.85f, 0.66f, 0.2f), skinCol = C(0.95f, 0.8f, 0.45f), accent = C(1f, 0.9f, 0.5f), eye = Color.white, glowEyes = true, metal = true, extra = 7, price = 100000000 },
+    };
+
+    static Color C(float r, float g, float b) { return new Color(r, g, b); }
 
     public static string Trait(Faction f) { return Traits[(int)f]; }
 
