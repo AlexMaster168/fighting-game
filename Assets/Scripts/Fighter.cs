@@ -135,6 +135,7 @@ public class Move
     public float[] hits;                 // several hit moments for flurries; defaults to hitAt
     public int ability;                  // 1..3: a cast that fires an ability instead of hitting
     public bool big, low, launch, knockdown, air, weaponMove, unblockable, power, kick, slam, flashLine, ranged;
+    public bool armor;                   // super armor: hits taken during the move do not interrupt it
 
     float[] hitCache;
     public float[] Hits
@@ -169,7 +170,7 @@ public class Fighter : MonoBehaviour
     public bool isPlayer, controlsEnabled, autoPlay;
     public Item weapon, helmet, armor;
     public Fighter target;
-    public bool female, victory;
+    public bool female, victory, boss;
     public int skinId;
     public Color hair = new Color(0.15f, 0.1f, 0.08f);
     public float hp = 100, maxHp = 100, energy, dmgMul = 1f, aiLevel = 1f, yawOffset, headY = 3.6f;
@@ -201,6 +202,17 @@ public class Fighter : MonoBehaviour
     float burnT, burnDps, poisonT, poisonDps, shockT, statusFx, lastDamage, nunA, nunV, lastWAng;
     Transform nunP;
     int facing = 1;
+    float giantT, invertT, slowT, mirrorT, bossCd = 5f;
+    public bool disarmed;                // the weapon was knocked out of the hands for this round
+    Item realWeapon;
+    GameObject droppedWeapon;
+    static bool HitCrit;                 // the blow being dealt right now is a critical one
+    public static string EventMsg = "";
+    public static float EventMsgT;
+    public int[] bossPowers;             // story bosses: their strange powers
+    int bossNext;
+    public static string BossMsg = "";
+    public static float BossMsgT;
     float rageT, hasteT, shieldT, shieldFx, crouchT, landT, moveDir, yawCur, idSeed, bounceY, capeA, capeV, flashT;
     bool critNext, tpDone, wasAir, snapYaw = true, groundHit, flashDirty;
     int hitIdx, hitVariant;
@@ -212,6 +224,7 @@ public class Fighter : MonoBehaviour
 
     struct Intent { public float move; public int ab; public bool jump, light, heavy, punch, kick, block, ult, down, dash, throwStar; }
 
+    float Pace { get { return (hasteT > 0f ? 1.35f : 1f) * (slowT > 0f ? 0.55f : 1f) * (weapon.faction == Faction.Dynasty ? 1.12f : 1f); } }
     public int Defense { get { return (helmet != null ? helmet.defense : 0) + (armor != null ? armor.defense : 0); } }
     public bool Dead { get { return hp <= 0; } }
     public bool Attacking { get { return cur != null; } }
@@ -387,7 +400,7 @@ public class Fighter : MonoBehaviour
         float depth = female ? 0.42f : 0.52f;          // chest, seen from the side
         float width = female ? 0.62f : 0.78f;          // across the shoulders
         float sz = width / 2f - 0.03f;
-        scale = female ? 1.28f : 1.4f;
+        scale = (female ? 1.28f : 1.4f) * (boss ? 1.15f : 1f);   // bosses tower over you
         transform.localScale = Vector3.one * scale;
         headY = 2.8f * scale;
 
@@ -452,10 +465,11 @@ public class Fighter : MonoBehaviour
         Part(headP, "skull", sph, new Vector3(0, 0.22f, 0), new Vector3(0.48f, 0.54f, 0.46f), skin, z);
         Transform eyeL = Part(headP, "eyeL", cube, new Vector3(0.21f, 0.25f, -0.1f), new Vector3(0.05f, 0.06f, 0.08f), sk.eye, z);
         Transform eyeR = Part(headP, "eyeR", cube, new Vector3(0.21f, 0.25f, 0.1f), new Vector3(0.05f, 0.06f, 0.08f), sk.eye, z);
-        if (sk.glowEyes)
+        if (sk.glowEyes || boss)
         {
-            eyeL.GetComponent<Renderer>().sharedMaterial = GlowOf(sk.eye);
-            eyeR.GetComponent<Renderer>().sharedMaterial = GlowOf(sk.eye);
+            Color ec = boss ? new Color(1f, 0.15f, 0.1f) : sk.eye;
+            eyeL.GetComponent<Renderer>().sharedMaterial = GlowOf(ec);
+            eyeR.GetComponent<Renderer>().sharedMaterial = GlowOf(ec);
         }
         Part(headP, "hairTop", sph, new Vector3(-0.04f, 0.32f, 0), new Vector3(0.53f, 0.42f, 0.5f), hair, z);
         if (female)
@@ -553,6 +567,12 @@ public class Fighter : MonoBehaviour
         if (sk.metal) Shine(body, 0.65f, 0.7f, n => true);
         Shine(body, 0.55f, 0.62f, n => ArmorParts.Contains(n));
         Shine(weaponP, 0.85f, 0.8f, n => n != "rod");
+        if (boss)
+        {
+            var bossAura = new GameObject("bossAura").AddComponent<Light>();
+            bossAura.transform.SetParent(chest, false);
+            bossAura.type = LightType.Point; bossAura.color = Db.FactionColor(weapon.faction); bossAura.range = 5f; bossAura.intensity = 2f;
+        }
         if (sk.extra == 7)
         {
             var aura = new GameObject("aura").AddComponent<Light>();
@@ -585,6 +605,7 @@ public class Fighter : MonoBehaviour
         weaponLen = Lw;
         twoHand = weapon.wtype == 4 ? 0f : 1f;
         grip2 = Mathf.Min(0.55f, Lw * 0.35f);
+        if (Db.IsFist(weapon)) return;   // bare hands: nothing to hold
         switch (weapon.wtype)
         {
             case 0: // sword
@@ -716,7 +737,7 @@ public class Fighter : MonoBehaviour
 
         moves["power"] = new Move
         {
-            name = "power", power = true, dur = 1.0f, hitAt = 0.55f, dmg = wd * 3.2f, reach = PowerRange, step = 0.4f, stun = 0.7f, knock = 1.4f,
+            name = "power", power = true, armor = true, dur = 1.0f, hitAt = 0.55f, dmg = wd * 4.6f + 15f, reach = PowerRange, step = 0.4f, stun = 0.7f, knock = 1.4f,
             big = true, knockdown = weapon.faction != Faction.Dynasty,
             unblockable = weapon.faction == Faction.Dynasty || weapon.faction == Faction.Heralds, gain = 0,
             times = new[] { 0f, 0.3f, 0.55f, 0.8f, 1f },
@@ -846,7 +867,7 @@ public class Fighter : MonoBehaviour
                 };
                 moves["slash2"] = new Move
                 {
-                    name = "slash2", weaponMove = true, dur = 0.6f / ws, hitAt = 0.45f, dmg = wd * 1.2f, reach = wr, step = 0.4f, stun = 0.5f, knock = 0.8f, big = true, launch = true, knockdown = true, gain = 12,
+                    name = "slash2", weaponMove = true, armor = true, dur = 0.6f / ws, hitAt = 0.45f, dmg = wd * 1.2f, reach = wr, step = 0.4f, stun = 0.5f, knock = 0.8f, big = true, launch = true, knockdown = true, gain = 12,
                     times = new[] { 0f, 0.25f, 0.45f, 0.7f, 1f },
                     keys = new[]
                     {
@@ -859,7 +880,7 @@ public class Fighter : MonoBehaviour
                 };
                 moves["smash"] = new Move
                 {
-                    name = "smash", weaponMove = true, slam = true, dur = 1.1f / ws, hitAt = 0.58f, dmg = wd * 2.0f, reach = wr + 2.6f, step = 0.3f, stun = 0.6f, knock = 1.3f, big = true, knockdown = true, hop = 5.5f, gain = 15,
+                    name = "smash", weaponMove = true, slam = true, armor = true, dur = 1.1f / ws, hitAt = 0.58f, dmg = wd * 2.0f, reach = wr + 2.6f, step = 0.3f, stun = 0.6f, knock = 1.3f, big = true, knockdown = true, hop = 5.5f, gain = 15,
                     times = new[] { 0f, 0.4f, 0.58f, 0.82f, 1f },
                     keys = new[]
                     {
@@ -975,6 +996,17 @@ public class Fighter : MonoBehaviour
     {
         Pose palm = OneHand(p => { p.lean = 10; p.hipX = 0.15f; p.lUp = 90; p.lFo = -5; p.thighF = 36; p.shinF = -36; p.thighB = -26; });
         Pose raise = K(p => { p.lean = -8; p.head = 6; p.wx = 0.2f; p.wy = 0.9f; p.wAng = 95; p.thighF = 24; p.shinF = -20; p.thighB = -20; });
+        moves["bosscast"] = new Move
+        {
+            name = "bosscast", armor = true, dur = 0.6f, hitAt = 0.5f, hits = new float[0], step = 0f, gain = 0,
+            times = new[] { 0f, 0.4f, 1f },
+            keys = new[]
+            {
+                G(),
+                K(p => { p.lean = -12; p.hipY = -0.08f; p.wx = 0.1f; p.wy = 0.9f; p.wAng = 100; p.thighF = 22; p.shinF = -26; p.thighB = -22; p.shinB = -12; }),
+                G(),
+            },
+        };
         moves["throw"] = new Move
         {
             name = "throw", ability = 4, dur = 0.32f, hitAt = 0.4f, step = 0f, gain = 0,
@@ -1031,6 +1063,7 @@ public class Fighter : MonoBehaviour
             if (tap == lastTapDir && Time.time - lastTapT < 0.25f) { it.dash = true; lastTapDir = 0; }
             else { lastTapDir = tap; lastTapT = Time.time; }
         }
+        if (invertT > 0f) it.move = -it.move;   // a boss twisted your senses
         return it;
     }
 
@@ -1038,6 +1071,16 @@ public class Fighter : MonoBehaviour
     {
         Intent it = new Intent();
         if (target == null || target.Dead) return it;
+        if (boss && bossPowers != null && bossPowers.Length > 0)
+        {
+            bossCd -= Time.deltaTime;
+            if (bossCd <= 0f && cur == null && Grounded && target.Hittable)
+            {
+                bossCd = Random.Range(7f, 10f) * (hp < maxHp * 0.5f ? 0.7f : 1f);
+                BossPower(bossPowers[bossNext++ % bossPowers.Length]);
+                return it;
+            }
+        }
         float dx = target.transform.position.x - transform.position.x, dist = Mathf.Abs(dx);
         float wr = WeaponReach;
         aiTimer -= Time.deltaTime;
@@ -1263,6 +1306,159 @@ public class Fighter : MonoBehaviour
         }
     }
 
+    // ---------- disarm ----------
+    public void Disarm(int dir)
+    {
+        if (disarmed || Db.IsFist(weapon)) return;
+        disarmed = true;
+        realWeapon = weapon;
+        if (DebugLog) Debug.Log("EVT disarm " + name + " lost " + weapon.name);
+        EventMsg = (isPlayer ? "ТЕБЯ ОБЕЗОРУЖИЛИ" : "ОРУЖИЕ ВЫБИТО") + "!";
+        EventMsgT = Time.unscaledTime + 1.8f;
+        GameAudio.Sfx("block");
+        Fx.Sparks(weaponP.position, new Color(1f, 0.9f, 0.5f), 16, 7f);
+
+        // the weapon flies off and lies on the floor until the round ends
+        Transform w = weaponP;
+        w.SetParent(null, true);
+        droppedWeapon = w.gameObject;
+        StartCoroutine(FlyAway(w, dir));
+
+        weapon = Db.Fists(realWeapon.faction);
+        weaponP = Pivot(chest, "weapon", Vector3.zero);
+        BuildWeapon(Color.white, Color.white);
+        wTrail = MakeTrail(weaponP, new Vector3(weaponLen, 0f, 0f), Color.white, 0.3f * scale, 0.12f);
+        BuildMoves();
+    }
+
+    System.Collections.IEnumerator FlyAway(Transform w, int dir)
+    {
+        Vector3 v = new Vector3(dir * 4.5f, 8f, 0f);
+        float spin = 900f * dir;
+        while (w != null)
+        {
+            float dt = Time.deltaTime;
+            v.y -= 24f * dt;
+            w.position += v * dt;
+            w.Rotate(0f, 0f, -spin * dt, Space.World);
+            Vector3 p = w.position;
+            p.x = Mathf.Clamp(p.x, -ArenaHalf - 1f, ArenaHalf + 1f);
+            w.position = p;
+            if (v.y < 0f && p.y <= 0.15f)
+            {
+                w.position = new Vector3(p.x, 0.12f, 0.4f);
+                w.rotation = Quaternion.Euler(90f, 0f, Random.Range(0f, 360f));
+                Fx.Dust(w.position, 6, 1.5f);
+                GameAudio.Sfx("hit");
+                yield break;
+            }
+            yield return null;
+        }
+    }
+
+    // ---------- boss powers ----------
+    public static readonly string[] BossPowerNames = { "ГИГАНТ", "ЗЕРКАЛЬНЫЙ ПАНЦИРЬ", "ИНВЕРСИЯ", "ЗАМЕДЛЕНИЕ ВРЕМЕНИ", "ТЕНЕВОЙ ШКВАЛ", "ВОРОНКА", "ДОЖДЬ ЧЕРЕПОВ", "ПОХИЩЕНИЕ ДУШИ" };
+    static readonly Color[] BossPowerCol =
+    {
+        new Color(1f, 0.3f, 0.1f), new Color(0.85f, 0.92f, 1f), new Color(0.9f, 0.3f, 1f), new Color(0.5f, 0.8f, 1f),
+        new Color(0.5f, 0.1f, 0.8f), new Color(0.35f, 0.05f, 0.5f), new Color(0.6f, 1f, 0.4f), new Color(0.3f, 1f, 0.9f),
+    };
+    static readonly Move FlurryMove = new Move { name = "flurry", stun = 0.35f, knock = 0.4f, gain = 0f };
+    static readonly Move FlurryLast = new Move { name = "flurry", stun = 0.5f, knock = 1.2f, big = true, knockdown = true, gain = 0f };
+    static readonly Move VortexBurst = new Move { name = "vortex", stun = 0.5f, knock = 2.2f, big = true, knockdown = true, unblockable = true, gain = 0f };
+
+    void BossPower(int k)
+    {
+        cur = moves["bosscast"];
+        mt = 0f; stepped = 0f; hitDone = false; hitIdx = 0; buf = null;
+        BossMsg = BossPowerNames[k];
+        BossMsgT = Time.unscaledTime + 2.2f;
+        if (DebugLog) Debug.Log("EVT boss power " + BossMsg);
+        Color col = BossPowerCol[k];
+        Vector3 c = transform.position + new Vector3(0, 2f * scale, 0);
+        Fx.Flash(c, col, 12f, 0.7f);
+        Shake = Mathf.Max(Shake, 0.15f);
+        for (int i = 0; i < 16; i++)
+        {
+            float a = i / 16f * Mathf.PI * 2f;
+            Fx.Spawn(c, col, 0.35f, 0.6f, new Vector3(Mathf.Cos(a) * 5f, Mathf.Sin(a) * 5f, 0f), 0f).Mode(1);
+        }
+        Vector3 tc = target.transform.position + new Vector3(0, 2f, 0);
+        switch (k)
+        {
+            case 0: giantT = 7f; GameAudio.Sfx("hit2"); break;                                   // grows huge, hits harder, cannot be staggered
+            case 1: mirrorT = 4f; GameAudio.Sfx("holy"); break;                                  // every blow is thrown back
+            case 2: target.invertT = 4f; GameAudio.Sfx("dark"); SmokePuff(target.transform.position); break;   // left is right and right is left
+            case 3: target.slowT = 5f; GameAudio.Sfx("zap"); Fx.Flash(tc, col, 10f, 0.6f); break; // time crawls for you
+            case 4: StartCoroutine(ShadowFlurry()); break;
+            case 5: StartCoroutine(Vortex()); break;
+            case 6: StartCoroutine(SkullRain()); break;
+            default:                                                                               // steals your charges and some life
+                GameAudio.Sfx("dark");
+                float stolen = target.energy;
+                target.energy = Mathf.Max(0f, target.energy - 67f);
+                energy = Mathf.Min(100f, energy + stolen * 0.5f);
+                hp = Mathf.Min(maxHp, hp + maxHp * 0.08f);
+                if (target.Hittable) { target.lastDamage = 6f * dmgMul; target.DirectDamage(6f * dmgMul); target.flashT = 0.1f; target.flashDirty = true; }
+                for (int i = 0; i < 3; i++) Fx.Bolt(tc, c + new Vector3(0, i * 0.3f - 0.3f, 0), col, 0.1f, 0.5f);
+                break;
+        }
+    }
+
+    // vanishes and strikes from behind three times
+    System.Collections.IEnumerator ShadowFlurry()
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            yield return new WaitForSeconds(0.45f);
+            if (target == null || Dead || target.Dead) yield break;
+            TeleportBehind();
+            Vector3 tp = target.transform.position + new Vector3(0, 2f, 0);
+            Fx.Seg(tp + new Vector3(-1f, 1f, 0), tp + new Vector3(1f, -1f, 0), new Color(0.7f, 0.3f, 1f), 0.15f, 0.25f);
+            if (target.Hittable) target.TakeHit(i == 2 ? FlurryLast : FlurryMove, (8f + weapon.damage * 0.6f) * dmgMul, facing);
+        }
+    }
+
+    // a black hole drags you in, then bursts
+    System.Collections.IEnumerator Vortex()
+    {
+        GameAudio.Sfx("dark");
+        float t = 0f, tick = 0f;
+        while (t < 1.6f)
+        {
+            if (target == null || Dead || target.Dead) yield break;
+            t += Time.deltaTime; tick += Time.deltaTime;
+            Vector3 tp = target.transform.position;
+            float gap = transform.position.x - tp.x;
+            if (Mathf.Abs(gap) > 1.6f && target.dashT <= 0f) { tp.x += Mathf.Sign(gap) * 5.5f * Time.deltaTime; target.transform.position = tp; }
+            Vector3 hole = transform.position + new Vector3(facing * 1.3f, 2f * scale, 0f);
+            float a = t * 14f;
+            Fx.Spawn(hole + new Vector3(Mathf.Cos(a) * 1.4f, Mathf.Sin(a) * 1.4f, 0f), new Color(0.35f, 0.05f, 0.5f), 0.35f, 0.3f, new Vector3(-Mathf.Cos(a), -Mathf.Sin(a), 0f) * 4f, 0f);
+            if (tick > 0.3f) { tick = 0f; if (target.Hittable) { target.lastDamage = 2.5f * dmgMul; target.DirectDamage(2.5f * dmgMul); } }
+            yield return null;
+        }
+        if (target != null && !Dead && target.Hittable && Mathf.Abs(target.transform.position.x - transform.position.x) < 3.5f)
+        {
+            Fx.Flash(target.transform.position + new Vector3(0, 2f, 0), new Color(0.6f, 0.2f, 0.9f), 14f, 0.5f);
+            target.TakeHit(VortexBurst, (10f + weapon.damage * 0.8f) * dmgMul, target.transform.position.x >= transform.position.x ? 1 : -1);
+        }
+    }
+
+    // glowing skulls rain down around you
+    System.Collections.IEnumerator SkullRain()
+    {
+        GameAudio.Sfx("dark");
+        for (int i = 0; i < 6; i++)
+        {
+            if (target == null || Dead) yield break;
+            float x = target.transform.position.x + Random.Range(-1.8f, 1.8f);
+            Vector3 start = new Vector3(x + Random.Range(-1f, 1f), 14f, 0.2f);
+            Vector3 v = (new Vector3(x, 0.3f, 0f) - start).normalized * 18f;
+            Projectile.Launch(target, start, v, 0.55f, new Color(0.6f, 1f, 0.4f), (5f + weapon.damage * 0.35f) * dmgMul, MeteorMove, t => t.ApplyStatus("poison", 2f, 2f), true, 1.2f);
+            yield return new WaitForSeconds(0.22f);
+        }
+    }
+
     // vanish in smoke and reappear on the far side of the enemy (in front if there is no room behind)
     void TeleportBehind()
     {
@@ -1334,6 +1530,11 @@ public class Fighter : MonoBehaviour
             string b = "";
             if (rageT > 0f) b += "<color=#ff5030>ЯРОСТЬ</color> ";
             if (hasteT > 0f) b += "<color=#60e0ff>УСКОРЕНИЕ</color> ";
+            if (disarmed) b += "<color=#ff8080>БЕЗ ОРУЖИЯ</color> ";
+            if (giantT > 0f) b += "<color=#ff5020>ГИГАНТ</color> ";
+            if (mirrorT > 0f) b += "<color=#d8e8ff>ЗЕРКАЛО</color> ";
+            if (invertT > 0f) b += "<color=#e060ff>ИНВЕРСИЯ</color> ";
+            if (slowT > 0f) b += "<color=#90b8d0>ЗАМЕДЛЕН</color> ";
             if (shieldT > 0f) b += "<color=#ffe070>ЩИТ</color> ";
             if (invulnT > 0f && dashT <= 0f && controlsEnabled) b += "<color=#ffffff>НЕУЯЗВИМ</color> ";
             if (critNext) b += "<color=#d080ff>КРИТ</color> ";
@@ -1364,16 +1565,22 @@ public class Fighter : MonoBehaviour
         if (m.slam) SlamVfx(mp);
         if (m.flashLine)
             Fx.Seg(new Vector3(mp.x - facing * 3.4f, 1.7f * scale, 0f), new Vector3(mp.x + facing * 0.6f, 1.7f * scale, 0f), Color.white, 0.12f, 0.3f);
-        bool vertOk = m.power || (dy < 1.9f && (!m.low || target.jumpY < 0.6f) && (!m.slam || target.jumpY < 0.8f));
-        if (dx > -0.4f && dx <= m.reach && vertOk)
+        // the Heralds are precise: their strikes reach a little further, catch jumpers and find the gaps in armor
+        bool precise = weapon.faction == Faction.Heralds && !m.power;
+        bool vertOk = m.power || (dy < (precise ? 2.4f : 1.9f) && (!m.low || target.jumpY < 0.6f) && (!m.slam || target.jumpY < 0.8f));
+        if (dx > (precise ? -0.9f : -0.4f) && dx <= m.reach + (precise ? 0.35f : 0f) && vertOk)
         {
             float d = m.dmg * dmgMul;
+            if (precise) { float def = target.Defense; d *= 1f + 0.6f * def / (def + 100f); }
+            if (giantT > 0f) d *= 1.4f;
             // weapon strikes can crit; the Heralds' light is always a precise, critical hit
             bool crit = critNext || ((m.weaponMove || (m.power && weapon.faction == Faction.Heralds)) && Random.value < (m.power ? 1f : weapon.crit + m.critBonus));
             critNext = false;
             if (crit) d *= 1.6f;
             if (rageT > 0f) d *= 1.5f;
+            HitCrit = crit;
             bool landed = target.TakeHit(m, d, facing);
+            HitCrit = false;
             if (landed)
             {
                 energy = Mathf.Min(100f, energy + m.gain + (m.power ? 0f : d * 0.08f));
@@ -1482,6 +1689,16 @@ public class Fighter : MonoBehaviour
         }
         d *= 1f - Defense / (Defense + 100f);
         Vector3 chest = transform.position + new Vector3(0, 1.9f * scale + jumpY, 0);
+        if (mirrorT > 0f && target != null && !target.Dead)
+        {
+            // the mirror shell throws the blow back at the attacker
+            Fx.Sparks(chest, new Color(0.85f, 0.9f, 1f), 14, 7f);
+            Fx.Bolt(chest, target.transform.position + new Vector3(0, 1.9f, 0), new Color(0.8f, 0.9f, 1f), 0.08f, 0.25f);
+            GameAudio.Sfx("block");
+            target.flashT = 0.1f; target.flashDirty = true;
+            target.lastDamage = d * 0.7f; target.DirectDamage(d * 0.7f);
+            return false;
+        }
         bool blocked = blocking && facing == -dir && !m.low && !m.unblockable;
         Vector3 p = transform.position;
         if (blocked)
@@ -1515,6 +1732,19 @@ public class Fighter : MonoBehaviour
             lastDamage = d; DirectDamage(d);
             return true;
         }
+        if ((cur != null && cur.armor) || giantT > 0f)
+        {
+            // super armor: the blow hurts but the attack goes on
+            if (cur != null && cur.power) d *= 0.5f;
+            if (DebugLog) Debug.Log("EVT armor hit on " + name + " during " + (cur != null ? cur.name : "giant"));
+            Fx.Sparks(chest, new Color(1f, 0.75f, 0.3f), 8, 5f);
+            GameAudio.Sfx("hit");
+            HitStop = Mathf.Max(HitStop, 0.03f);
+            flashT = 0.08f; flashDirty = true;
+            energy = Mathf.Min(100f, energy + d * 0.2f);
+            lastDamage = d; DirectDamage(d);
+            return true;
+        }
         if (m.ranged) rangedImmuneT = 1.2f;
         cur = null; buf = null;
         crouchT = 0f; hitVariant = m.big ? 1 : 0; flashT = 0.1f; flashDirty = true;
@@ -1523,6 +1753,8 @@ public class Fighter : MonoBehaviour
         transform.position = p;
         if (m.launch) vy = 8.5f;
         if (m.knockdown) { downT = 1.15f; downElapsed = 0f; }
+        // only a heavy critical blow can knock the weapon away, and rarely; bosses never let go
+        if (HitCrit && !boss && (m.big || m.power) && !m.ranged && d >= maxHp * 0.12f && Random.value < 0.2f) Disarm(dir);
         energy = Mathf.Min(100f, energy + d * 0.35f);
         Fx.Sparks(chest, new Color(1f, 0.35f, 0.15f), m.big ? 16 : 9, m.big ? 8f : 6f);
         HitStop = Mathf.Max(HitStop, m.big ? 0.09f : 0.05f);
@@ -1535,6 +1767,14 @@ public class Fighter : MonoBehaviour
 
     public void ResetForRound(float x)
     {
+        if (disarmed)
+        {
+            // a new round: the weapon is back in the hands
+            disarmed = false;
+            weapon = realWeapon;
+            if (droppedWeapon != null) Destroy(droppedWeapon);
+            Build();
+        }
         hp = maxHp; cur = null; buf = null; stun = 0f; downT = 0f; downElapsed = 0f;
         vy = 0f; jumpY = 0f; blocking = false; moving = false; blockTimer = 0f; aiTimer = 1f; guard = 0f; blockCd = 0f; seenMove = null;
         controlsEnabled = false;
@@ -1543,6 +1783,8 @@ public class Fighter : MonoBehaviour
         transform.position = new Vector3(x, 0, 0);
         disp = null;
         rageT = hasteT = shieldT = crouchT = landT = 0f;
+        giantT = invertT = slowT = mirrorT = 0f; bossCd = 5f; bossNext = 0;
+        transform.localScale = Vector3.one * scale;
         dashT = dashCd = invulnT = rangedImmuneT = aiAbilityCd = 0f; shuriken = MaxShuriken; shurikenT = 0f; critNext = false; victory = false; snapYaw = true; wasAir = false;
         StopAllCoroutines();
         if (wTrail != null) { wTrail.Clear(); fTrail.Clear(); }
@@ -1592,6 +1834,41 @@ public class Fighter : MonoBehaviour
             rageT -= dt;
             if (statusFx <= 0f) Fx.Spawn(p + new Vector3(Random.Range(-0.5f, 0.5f), Random.Range(0.5f, 3.6f), Random.Range(-0.3f, 0.3f)), new Color(1f, 0.2f, 0.1f), 0.3f, 0.45f, Vector3.up * 2.5f, 0f).Mode(1);
         }
+        if (cur != null && cur.armor && statusFx <= 0f)
+            Fx.Spawn(p + new Vector3(Random.Range(-0.5f, 0.5f), Random.Range(0.5f, 3.4f), 0f), new Color(1f, 0.7f, 0.25f), 0.25f, 0.25f, Vector3.up, 0f).Mode(1);
+        if (boss)
+        {
+            float gs = giantT > 0f ? 1.3f : 1f;
+            transform.localScale = Vector3.Lerp(transform.localScale, Vector3.one * scale * gs, dt * 5f);
+        }
+        if (giantT > 0f)
+        {
+            giantT -= dt;
+            if (statusFx <= 0f) Fx.Spawn(p + new Vector3(Random.Range(-0.7f, 0.7f), Random.Range(0.2f, 4.5f), 0f), new Color(1f, 0.3f, 0.1f), 0.4f, 0.4f, Vector3.up * 3f, 0f).Mode(1);
+        }
+        if (mirrorT > 0f)
+        {
+            mirrorT -= dt;
+            if (statusFx <= 0f)
+            {
+                float a = Random.value * Mathf.PI * 2f;
+                Fx.Spawn(p + new Vector3(Mathf.Cos(a) * 1.1f, 2f + Mathf.Sin(a) * 1.6f, 0f), new Color(0.85f, 0.92f, 1f), 0.3f, 0.3f, Vector3.zero, 0f).Mode(1);
+            }
+        }
+        if (invertT > 0f)
+        {
+            invertT -= dt;
+            if (statusFx <= 0f)
+            {
+                float a = Time.time * 8f;
+                Fx.Spawn(p + new Vector3(Mathf.Cos(a) * 0.6f, 4.3f, Mathf.Sin(a) * 0.3f), new Color(0.9f, 0.3f, 1f), 0.25f, 0.35f, Vector3.zero, 0f).Mode(1);
+            }
+        }
+        if (slowT > 0f)
+        {
+            slowT -= dt;
+            if (statusFx <= 0f) Fx.Spawn(p + new Vector3(Random.Range(-0.5f, 0.5f), Random.Range(0.4f, 3.6f), 0f), new Color(0.55f, 0.75f, 0.85f), 0.35f, 0.8f, Vector3.down * 0.4f, 0f);
+        }
         if (hasteT > 0f)
         {
             hasteT -= dt;
@@ -1612,6 +1889,8 @@ public class Fighter : MonoBehaviour
                 }
             }
         }
+        if (boss && statusFx <= 0f)
+            Fx.Spawn(p + new Vector3(Random.Range(-0.6f, 0.6f), Random.Range(0.3f, 3.8f), Random.Range(-0.3f, 0.3f)), Color.Lerp(Db.FactionColor(weapon.faction), Color.black, 0.3f), 0.25f, 0.6f, Vector3.up * 1.8f, 0f).Mode(1);
         if (statusFx <= 0f) statusFx = 0.12f;
     }
 
@@ -1694,7 +1973,7 @@ public class Fighter : MonoBehaviour
         float dx = 0f;
         if (cur != null)
         {
-            mt += dt * (hasteT > 0f ? 1.35f : 1f);
+            mt += dt * Pace;
             float u = mt / cur.dur;
             float want = cur.step * Mathf.Clamp01((u - cur.stepFrom) / Mathf.Max(0.01f, cur.hitAt - cur.stepFrom));
             dx = (want - stepped) * facing;
@@ -1719,7 +1998,7 @@ public class Fighter : MonoBehaviour
             blocking = it.block && Grounded;
             if (!blocking)
             {
-                float spd = (isPlayer ? 4.5f : 3.5f) * (hasteT > 0f ? 1.35f : 1f) * (it.move * facing < 0f ? 0.95f : 1f);
+                float spd = (isPlayer ? 4.5f : 3.5f) * Pace * (it.move * facing < 0f ? 0.95f : 1f);
                 dx = it.move * spd * dt;
                 moving = it.move != 0f && Grounded;
                 moveDir = it.move;
@@ -1765,7 +2044,7 @@ public class Fighter : MonoBehaviour
         if (moving)
         {
             bool fwd = moveDir * facing > 0f;
-            walkT += dt * (fwd ? 11f : 8.5f) * (hasteT > 0f ? 1.35f : 1f);
+            walkT += dt * (fwd ? 11f : 8.5f) * Pace;
             float s = Mathf.Sin(walkT), c = Mathf.Cos(walkT);
             float amp = fwd ? 34f : 24f;
             p.thighF = 20f + s * amp;

@@ -45,9 +45,9 @@ public static class Db
     // each faction fights its own way
     //                                      Legion Dynasty Heralds Shadow
     static readonly float[] DmgMod   = { 1.30f, 0.90f, 1.00f, 1.00f };   // Legion: heavy hitters
-    static readonly float[] SpdMod   = { 0.90f, 1.25f, 1.05f, 1.10f };   // Dynasty: fast combos
-    static readonly float[] ReachMod = { 1.00f, 1.00f, 1.10f, 1.00f };   // Heralds: long, precise
-    static readonly float[] CritMod  = { 0.05f, 0.08f, 0.22f, 0.12f };  // Heralds: precision = crits
+    static readonly float[] SpdMod   = { 0.90f, 1.40f, 1.05f, 1.10f };   // Dynasty: fast combos
+    static readonly float[] ReachMod = { 1.00f, 1.00f, 1.20f, 1.00f };   // Heralds: long, precise
+    static readonly float[] CritMod  = { 0.05f, 0.08f, 0.30f, 0.12f };  // Heralds: precision = crits
 
     static readonly int[][] WTypes =
     {
@@ -159,6 +159,20 @@ public static class Db
     }
 
     static void Add(Item it) { All.Add(it); ById[it.id] = it; }
+
+    // no weapon: fighting with bare fists, keeping the faction's style and powers
+    public static bool IsFist(Item it) { return it != null && it.id.StartsWith("FIST_"); }
+    public static Item Fists(Faction f)
+    {
+        string id = "FIST_" + (int)f;
+        Item it;
+        if (!ById.TryGetValue(id, out it))
+        {
+            it = new Item { id = id, name = "Кулаки", slot = Slot.Weapon, faction = f, tier = 1, wtype = 4, damage = 7, reach = 0.8f, speed = 1.3f, crit = 0.1f };
+            ById[id] = it;
+        }
+        return it;
+    }
 
     public static Item Get(string id) { Item it; return id != null && ById.TryGetValue(id, out it) ? it : null; }
 }
